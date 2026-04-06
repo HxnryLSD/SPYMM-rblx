@@ -1,5 +1,5 @@
 --[[
-    SPYMM v8.1 - Obsidian UI
+    SPYMM v8.2 - Obsidian UI
     Survive the Apocalypse
 ]]
 
@@ -26,6 +26,7 @@ local pickUpItemRemote = Remotes and Remotes:FindFirstChild("Interaction") and R
 local placeStructureRemote = Remotes and Remotes:FindFirstChild("Building") and Remotes.Building:FindFirstChild("PlaceStructure")
 local buyItemRemote = Remotes and Remotes:FindFirstChild("Merchant") and Remotes.Merchant:FindFirstChild("BuyItem")
 local addSuppressorRemote = Remotes and Remotes:FindFirstChild("Tools") and Remotes.Tools:FindFirstChild("AddSuppressor")
+local adjustBackpackRemote = Remotes and Remotes:FindFirstChild("Tools") and Remotes.Tools:FindFirstChild("AdjustBackpack")
 local resetRemote = Remotes and Remotes:FindFirstChild("Misc") and Remotes.Misc:FindFirstChild("Reset")
 
 
@@ -44,7 +45,7 @@ Library.ForceCheckbox = false
 Library.ShowToggleFrameInKeybinds = true
 
 local Window = Library:CreateWindow({
-    Title = "SPYMM v8.1",
+    Title = "SPYMM v8.2",
     Footer = "Survive the Apocalypse",
     NotifySide = "Right",
     ShowCustomCursor = true,
@@ -66,7 +67,6 @@ local connections = {}
 local mobESPInstances = {}
 local playerESPInstances = {}
 local structureESPInstances = {}
-local autoPickupConnection = nil
 local flyBV, flyBG = nil, nil
 local flyActive = false
 local antiAFKConn = nil
@@ -79,6 +79,8 @@ local killAuraIndicatorLine   = nil  -- [ADDED v7.3.3] Kill Aura snapline to cur
 local killAuraIndicatorCircle = nil  -- [ADDED v7.3.3] Kill Aura circle on current target
 -- Remove Fog state managed by enableRemoveFog/disableRemoveFog
 -- bringPickup state managed by startBringPickup/stopBringPickup
+-- repairAura state managed by startRepairAura/stopRepairAura
+local repairAuraConn = nil
 
 local originalValues = {
     walkSpeed = nil,
@@ -97,6 +99,15 @@ local remoteSpyEnabled = false  -- [ADDED v7.3] Remote Spy state
 local remoteSpyLogs = {}  -- [ADDED v7.3] Remote call logs
 
 local mobNames = {"Runner", "Crawler", "Riot", "Zombie", "Brute", "Spitter", "Boss"}
+
+-- ============================================
+-- GLOBAL ESP CONFIG (driven by UI sliders, shared by all ESP systems)
+-- ============================================
+local espConfig = {
+    textSize            = 10,   -- ESP Text Size slider
+    fillTransparency    = 0.4,  -- Fill Transparency slider
+    outlineTransparency = 0.0,  -- Outline Transparency slider
+}
 
 -- ============================================
 -- ITEM CATEGORIES & COLOR DEFINITIONS
@@ -202,7 +213,7 @@ for _, def in ipairs(espDefinitions) do
     espSystems[def.key] = sys
 end
 
--- Build flat itemNames from all 6 ESP categories + extra items (for Auto Pickup, Teleport)
+-- Build flat itemNames from all ESP categories (used for BringPickupItem filter)
 local itemNames = {}
 local itemCategoryLookup = {}
 for _, def in ipairs(espDefinitions) do
@@ -211,7 +222,7 @@ for _, def in ipairs(espDefinitions) do
         itemCategoryLookup[itemName] = def.key
     end
 end
--- Add extra categories not covered by dedicated ESP (still usable in Auto Pickup / Teleport)
+-- Add extra categories not covered by dedicated ESP (still usable in BringPickupItem / Teleport)
 local extraItemCategories = {
     Ammo = { "Ammo Box", "Long Ammo", "Medium Ammo", "Pistol Ammo", "Shells" },
     Structures = {
@@ -407,16 +418,17 @@ local function createCategoryESP(sys, item)
     local mainPart = getItemMainPart(item)
     if not mainPart then return end
 
-    local espTable = {}
+    -- MainPart stored at top level so the always-on connection can access it
+    local espTable = { MainPart = mainPart }
 
     if sys.vars.Chams then
         local highlight = Instance.new("Highlight")
         highlight.Name = sys.key .. "ESP_Highlight"
         highlight.Adornee = item
         highlight.FillColor = sys.colors.fill
-        highlight.FillTransparency = 0.4
+        highlight.FillTransparency = espConfig.fillTransparency
         highlight.OutlineColor = sys.colors.outline
-        highlight.OutlineTransparency = 0.8
+        highlight.OutlineTransparency = espConfig.outlineTransparency
         highlight.Parent = item
         espTable.Highlight = highlight
     end
@@ -435,8 +447,6 @@ local function createCategoryESP(sys, item)
         frame.BackgroundTransparency = 1
         frame.Parent = billboard
 
-        -- Removed background frame (user requested - background was drawing over items)
-
         local nameLabel = Instance.new("TextLabel")
         nameLabel.Name = "NameLabel"
         nameLabel.Size = UDim2.new(1, 0, 0.5, 0)
@@ -447,7 +457,7 @@ local function createCategoryESP(sys, item)
         nameLabel.TextStrokeTransparency = 0.2
         nameLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
         nameLabel.Font = Enum.Font.GothamBold
-        nameLabel.TextSize = 14
+        nameLabel.TextSize = espConfig.textSize
         nameLabel.Visible = sys.vars.Name
         nameLabel.Parent = frame
 
@@ -461,42 +471,56 @@ local function createCategoryESP(sys, item)
         distLabel.TextStrokeTransparency = 0.2
         distLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
         distLabel.Font = Enum.Font.GothamBold
-        distLabel.TextSize = 12
+        distLabel.TextSize = math.max(espConfig.textSize - 2, 8)
         distLabel.Visible = sys.vars.Distance
         distLabel.Parent = frame
 
         espTable.Billboard = billboard
         espTable.NameLabel = nameLabel
         espTable.DistLabel = distLabel
-        espTable.MainPart = mainPart
-
-        local connection
-        connection = RunService.RenderStepped:Connect(function()
-            if not item or not item.Parent then
-                connection:Disconnect()
-                return
-            end
-            if distLabel and distLabel.Visible and distLabel.Parent then
-                local myChar = LocalPlayer.Character
-                local myRoot = myChar and (myChar:FindFirstChild("HumanoidRootPart") or myChar:FindFirstChild("Torso") or myChar:FindFirstChild("UpperTorso"))
-                if myRoot then
-                    local dist = (myRoot.Position - mainPart.Position).Magnitude
-                    distLabel.Text = math.floor(dist) .. "m"
-                    distLabel.TextColor3 = getDistanceColor(dist)
-                    local maxDist = Options and Options.ESPMaxDistance and Options.ESPMaxDistance.Value or 99999
-                    local visible = dist <= maxDist
-                    if billboard.Enabled ~= visible then
-                        billboard.Enabled = visible
-                    end
-                    if espTable.Highlight then
-                        espTable.Highlight.Enabled = visible
-                    end
-                end
-            end
-        end)
-        espTable.DistanceConnection = connection
-        table.insert(connections, connection)
     end
+
+    -- [FIX] Always-on Heartbeat connection:
+    --   * distance culling works even when Name/Distance labels are hidden
+    --   * auto-restores Highlight if destroyed by the game engine
+    --   * self-cleans when the item is removed from the world
+    local connection
+    connection = RunService.Heartbeat:Connect(function()
+        if not item or not item.Parent then
+            connection:Disconnect()
+            return
+        end
+        local myChar = LocalPlayer.Character
+        local myRoot = myChar and (myChar:FindFirstChild("HumanoidRootPart") or myChar:FindFirstChild("Torso") or myChar:FindFirstChild("UpperTorso"))
+        if not myRoot then return end
+        local dist = (myRoot.Position - mainPart.Position).Magnitude
+        local maxDist = Options and Options.ESPMaxDistance and Options.ESPMaxDistance.Value or 99999
+        local visible = dist <= maxDist
+        -- Auto-restore highlight if destroyed by the game
+        if sys.vars.Chams and (not espTable.Highlight or not espTable.Highlight.Parent) then
+            local h = Instance.new("Highlight")
+            h.Name = sys.key .. "ESP_Highlight"
+            h.Adornee = item
+            h.FillColor = sys.colors.fill
+            h.FillTransparency = espConfig.fillTransparency
+            h.OutlineColor = sys.colors.outline
+            h.OutlineTransparency = espConfig.outlineTransparency
+            h.Enabled = visible
+            h.Parent = item
+            espTable.Highlight = h
+        elseif espTable.Highlight and espTable.Highlight.Parent then
+            espTable.Highlight.Enabled = visible
+        end
+        if espTable.Billboard and espTable.Billboard.Parent then
+            espTable.Billboard.Enabled = visible
+            if espTable.DistLabel and sys.vars.Distance then
+                espTable.DistLabel.Text = math.floor(dist) .. "m"
+                espTable.DistLabel.TextColor3 = getDistanceColor(dist)
+            end
+        end
+    end)
+    espTable.DistanceConnection = connection
+    -- Not inserted into global connections table; self-disconnects via item.Parent check
 
     sys.instances[item] = espTable
 end
@@ -529,6 +553,7 @@ local function setupCategoryListeners(sys)
     sys.listenersSetup = true
     local addedConn = droppedItemsFolder.ChildAdded:Connect(function(child)
         if sys.vars.ESP and sys.itemList[child.Name] then
+            task.wait(0.2)  -- [FIX] Wait for item model/PrimaryPart to replicate
             createCategoryESP(sys, child)
         end
     end)
@@ -572,7 +597,7 @@ local function createMobESP(char)
     local root = char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso")
     if not root then return end
 
-    local espTable = {}
+    local espTable = { Root = root }
     local mobColors = mobTypeColors[char.Name] or {fill = Color3.fromRGB(220, 0, 0), outline = Color3.fromRGB(255, 185, 185)}
 
     if mobOptions.Chams then
@@ -580,15 +605,17 @@ local function createMobESP(char)
         highlight.Name = "MobESP_Highlight"
         highlight.Adornee = char
         highlight.FillColor = mobColors.fill
-        highlight.FillTransparency = 0.3
+        highlight.FillTransparency = espConfig.fillTransparency
         highlight.OutlineColor = mobColors.outline
-        highlight.OutlineTransparency = 0.8
+        highlight.OutlineTransparency = espConfig.outlineTransparency
         highlight.Parent = char
         espTable.Highlight = highlight
     end
 
+    -- Hoist billboard vars so always-on connection can access them
+    local billboard, nameLabel, distLabel
     if mobOptions.Name or mobOptions.Distance then
-        local billboard = Instance.new("BillboardGui")
+        billboard = Instance.new("BillboardGui")
         billboard.Name = "MobESP_NameDistance"
         billboard.Adornee = root
         billboard.Size = UDim2.new(0, 220, 0, 50)
@@ -601,7 +628,7 @@ local function createMobESP(char)
         frame.BackgroundTransparency = 1
         frame.Parent = billboard
 
-        local nameLabel = Instance.new("TextLabel")
+        nameLabel = Instance.new("TextLabel")
         nameLabel.Name = "NameLabel"
         nameLabel.Size = UDim2.new(1, 0, 0.5, 0)
         nameLabel.Position = UDim2.new(0, 0, 0, 0)
@@ -611,11 +638,11 @@ local function createMobESP(char)
         nameLabel.TextStrokeTransparency = 0.2
         nameLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
         nameLabel.Font = Enum.Font.GothamBold
-        nameLabel.TextSize = 14
+        nameLabel.TextSize = espConfig.textSize
         nameLabel.Visible = mobOptions.Name
         nameLabel.Parent = frame
 
-        local distLabel = Instance.new("TextLabel")
+        distLabel = Instance.new("TextLabel")
         distLabel.Name = "DistLabel"
         distLabel.Size = UDim2.new(1, 0, 0.5, 0)
         distLabel.Position = UDim2.new(0, 0, 0.5, 0)
@@ -625,46 +652,60 @@ local function createMobESP(char)
         distLabel.TextStrokeTransparency = 0.2
         distLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
         distLabel.Font = Enum.Font.GothamBold
-        distLabel.TextSize = 12
+        distLabel.TextSize = math.max(espConfig.textSize - 2, 8)
         distLabel.Visible = mobOptions.Distance
         distLabel.Parent = frame
 
         espTable.Billboard = billboard
         espTable.NameLabel = nameLabel
         espTable.DistLabel = distLabel
-        espTable.Root = root
+    end
 
-        local connection
-        connection = RunService.RenderStepped:Connect(function()
-            if not char or not char.Parent then
-                connection:Disconnect()
-                return
-            end
-
-            if nameLabel and nameLabel.Visible and nameLabel.Parent then
+    -- [FIX] Always-on connection: culls by distance regardless of label visibility,
+    --       auto-restores Highlights destroyed by the server, self-cleans on mob death
+    local connection
+    connection = RunService.Heartbeat:Connect(function()
+        if not char or not char.Parent then
+            connection:Disconnect()
+            return
+        end
+        local myChar = LocalPlayer.Character
+        local myRoot = myChar and (myChar:FindFirstChild("HumanoidRootPart") or myChar:FindFirstChild("Torso") or myChar:FindFirstChild("UpperTorso"))
+        if not myRoot then return end
+        local dist = (myRoot.Position - root.Position).Magnitude
+        local maxDist = Options and Options.ESPMaxDistance and Options.ESPMaxDistance.Value or 99999
+        local visible = dist <= maxDist
+        local mc = mobTypeColors[char.Name] or {fill = Color3.fromRGB(220, 0, 0), outline = Color3.fromRGB(255, 185, 185)}
+        if mobOptions.Chams and (not espTable.Highlight or not espTable.Highlight.Parent) then
+            local h = Instance.new("Highlight")
+            h.Name = "MobESP_Highlight"
+            h.Adornee = char
+            h.FillColor = mc.fill
+            h.FillTransparency = espConfig.fillTransparency
+            h.OutlineColor = mc.outline
+            h.OutlineTransparency = espConfig.outlineTransparency
+            h.Enabled = visible
+            h.Parent = char
+            espTable.Highlight = h
+        elseif espTable.Highlight and espTable.Highlight.Parent then
+            espTable.Highlight.Enabled = visible
+        end
+        if billboard and billboard.Parent then
+            billboard.Enabled = visible
+            if nameLabel and mobOptions.Name then
                 local hum = char:FindFirstChildOfClass("Humanoid")
                 if hum then
                     nameLabel.Text = char.Name .. " [" .. math.floor(hum.Health) .. "/" .. math.floor(hum.MaxHealth) .. "]"
                 end
             end
-
-            if distLabel and distLabel.Visible and distLabel.Parent then
-                local myChar = LocalPlayer.Character
-                local myRoot = myChar and (myChar:FindFirstChild("HumanoidRootPart") or myChar:FindFirstChild("Torso") or myChar:FindFirstChild("UpperTorso"))
-                if myRoot then
-                    local dist = (myRoot.Position - root.Position).Magnitude
-                    local maxDist = Options and Options.ESPMaxDistance and Options.ESPMaxDistance.Value or 99999
-                    distLabel.Text = math.floor(dist) .. "m"
-                    distLabel.TextColor3 = getDistanceColor(dist)
-                    local visible = dist <= maxDist
-                    if billboard.Enabled ~= visible then billboard.Enabled = visible end
-                    if espTable.Highlight then espTable.Highlight.Enabled = visible end
-                end
+            if distLabel and mobOptions.Distance then
+                distLabel.Text = math.floor(dist) .. "m"
+                distLabel.TextColor3 = getDistanceColor(dist)
             end
-        end)
-        espTable.DistanceConnection = connection
-        table.insert(connections, connection)
-    end
+        end
+    end)
+    espTable.DistanceConnection = connection
+    table.insert(connections, connection)
 
     mobESPInstances[char] = espTable
 end
@@ -678,8 +719,13 @@ local function refreshMobESP()
         Library:Notify({ Title = "Mob ESP", Description = "Characters folder not found (retrying...)", Time = 3 })
         return
     end
+    -- Build player char set to exclude real players (same logic as Kill Aura)
+    local playerCharSet = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Character then playerCharSet[p.Character] = true end
+    end
     for _, child in ipairs(charactersFolder:GetChildren()) do
-        if table.find(mobNames, child.Name) then
+        if child:IsA("Model") and not playerCharSet[child] then
             createMobESP(child)
         end
     end
@@ -705,22 +751,23 @@ local function createStructureESP(structure)
     local mainPart = structure.PrimaryPart or getItemMainPart(structure)
     if not mainPart then return end
 
-    local espTable = {}
+    local espTable = { MainPart = mainPart }
 
     if structureESPVars.Chams then
         local highlight = Instance.new("Highlight")
         highlight.Name = "StructESP_Highlight"
         highlight.Adornee = structure
         highlight.FillColor = Color3.fromRGB(0, 200, 150)
-        highlight.FillTransparency = 0.3
+        highlight.FillTransparency = espConfig.fillTransparency
         highlight.OutlineColor = Color3.fromRGB(100, 255, 200)
-        highlight.OutlineTransparency = 0.7
+        highlight.OutlineTransparency = espConfig.outlineTransparency
         highlight.Parent = structure
         espTable.Highlight = highlight
     end
 
+    local billboard, nameLabel, distLabel
     if structureESPVars.Name or structureESPVars.Distance then
-        local billboard = Instance.new("BillboardGui")
+        billboard = Instance.new("BillboardGui")
         billboard.Name = "StructESP_Info"
         billboard.Adornee = mainPart
         billboard.Size = UDim2.new(0, 250, 0, 50)
@@ -733,9 +780,7 @@ local function createStructureESP(structure)
         frame.BackgroundTransparency = 1
         frame.Parent = billboard
 
-        -- Removed background frame (user requested)
-
-        local nameLabel = Instance.new("TextLabel")
+        nameLabel = Instance.new("TextLabel")
         nameLabel.Name = "NameLabel"
         nameLabel.Size = UDim2.new(1, 0, 0.5, 0)
         nameLabel.Position = UDim2.new(0, 0, 0, 0)
@@ -745,11 +790,11 @@ local function createStructureESP(structure)
         nameLabel.TextStrokeTransparency = 0.2
         nameLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
         nameLabel.Font = Enum.Font.GothamBold
-        nameLabel.TextSize = 13
+        nameLabel.TextSize = espConfig.textSize
         nameLabel.Visible = structureESPVars.Name
         nameLabel.Parent = frame
 
-        local distLabel = Instance.new("TextLabel")
+        distLabel = Instance.new("TextLabel")
         distLabel.Name = "DistLabel"
         distLabel.Size = UDim2.new(1, 0, 0.5, 0)
         distLabel.Position = UDim2.new(0, 0, 0.5, 0)
@@ -759,42 +804,52 @@ local function createStructureESP(structure)
         distLabel.TextStrokeTransparency = 0.2
         distLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
         distLabel.Font = Enum.Font.GothamBold
-        distLabel.TextSize = 12
+        distLabel.TextSize = math.max(espConfig.textSize - 2, 8)
         distLabel.Visible = structureESPVars.Distance
         distLabel.Parent = frame
 
         espTable.Billboard = billboard
         espTable.NameLabel = nameLabel
         espTable.DistLabel = distLabel
-        espTable.MainPart = mainPart
-
-        local connection
-        connection = RunService.RenderStepped:Connect(function()
-            if not structure or not structure.Parent then
-                connection:Disconnect()
-                return
-            end
-            if distLabel and distLabel.Visible and distLabel.Parent then
-                local myChar = LocalPlayer.Character
-                local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
-                if myRoot then
-                    local dist = (myRoot.Position - mainPart.Position).Magnitude
-                    distLabel.Text = math.floor(dist) .. "m"
-                    distLabel.TextColor3 = getDistanceColor(dist)
-                    local maxDist = Options and Options.ESPMaxDistance and Options.ESPMaxDistance.Value or 99999
-                    local visible = dist <= maxDist
-                    if billboard.Enabled ~= visible then
-                        billboard.Enabled = visible
-                    end
-                    if espTable.Highlight then
-                        espTable.Highlight.Enabled = visible
-                    end
-                end
-            end
-        end)
-        espTable.DistanceConnection = connection
-        table.insert(connections, connection)
     end
+
+    -- [FIX] Always-on connection for distance culling + highlight restoration
+    local connection
+    connection = RunService.Heartbeat:Connect(function()
+        if not structure or not structure.Parent then
+            connection:Disconnect()
+            return
+        end
+        local myChar = LocalPlayer.Character
+        local myRoot = myChar and (myChar:FindFirstChild("HumanoidRootPart") or myChar:FindFirstChild("Torso") or myChar:FindFirstChild("UpperTorso"))
+        if not myRoot then return end
+        local dist = (myRoot.Position - mainPart.Position).Magnitude
+        local maxDist = Options and Options.ESPMaxDistance and Options.ESPMaxDistance.Value or 99999
+        local visible = dist <= maxDist
+        if structureESPVars.Chams and (not espTable.Highlight or not espTable.Highlight.Parent) then
+            local h = Instance.new("Highlight")
+            h.Name = "StructESP_Highlight"
+            h.Adornee = structure
+            h.FillColor = Color3.fromRGB(0, 200, 150)
+            h.FillTransparency = espConfig.fillTransparency
+            h.OutlineColor = Color3.fromRGB(100, 255, 200)
+            h.OutlineTransparency = espConfig.outlineTransparency
+            h.Enabled = visible
+            h.Parent = structure
+            espTable.Highlight = h
+        elseif espTable.Highlight and espTable.Highlight.Parent then
+            espTable.Highlight.Enabled = visible
+        end
+        if billboard and billboard.Parent then
+            billboard.Enabled = visible
+            if distLabel and structureESPVars.Distance then
+                distLabel.Text = math.floor(dist) .. "m"
+                distLabel.TextColor3 = getDistanceColor(dist)
+            end
+        end
+    end)
+    espTable.DistanceConnection = connection
+    table.insert(connections, connection)
 
     structureESPInstances[structure] = espTable
 end
@@ -808,8 +863,8 @@ local function refreshStructureESP()
         Library:Notify({ Title = "Structure ESP", Description = "Structures folder not found (retrying...)", Time = 3 })
         return
     end
-    for _, child in ipairs(structuresFolder:GetChildren()) do
-        if table.find(structureNames, child.Name) then
+    for _, child in ipairs(structuresFolder:GetDescendants()) do
+        if child:IsA("Model") and table.find(structureNames, child.Name) then
             createStructureESP(child)
         end
     end
@@ -846,15 +901,17 @@ local function createPlayerESP(player)
         highlight.Name = "PlayerESP_Highlight"
         highlight.Adornee = char
         highlight.FillColor = Color3.fromRGB(0, 100, 255)
-        highlight.FillTransparency = 0.3
+        highlight.FillTransparency = espConfig.fillTransparency
         highlight.OutlineColor = Color3.fromRGB(100, 180, 255)
-        highlight.OutlineTransparency = 0.8
+        highlight.OutlineTransparency = espConfig.outlineTransparency
         highlight.Parent = char
         espTable.Highlight = highlight
     end
 
+    -- Hoist so always-on connection can reference them after the block
+    local billboard, nameLabel, toolLabel, healthLabel, distLabel
     if playerESPVars.Name or playerESPVars.Distance or playerESPVars.Health then
-        local billboard = Instance.new("BillboardGui")
+        billboard = Instance.new("BillboardGui")
         billboard.Name = "PlayerESP_Info"
         billboard.Adornee = root
         billboard.Size = UDim2.new(0, 220, 0, 70)
@@ -867,7 +924,7 @@ local function createPlayerESP(player)
         frame.BackgroundTransparency = 1
         frame.Parent = billboard
 
-        local nameLabel = Instance.new("TextLabel")
+        nameLabel = Instance.new("TextLabel")
         nameLabel.Name = "NameLabel"
         nameLabel.Size = UDim2.new(1, 0, 0.3, 0)
         nameLabel.Position = UDim2.new(0, 0, 0, 0)
@@ -877,11 +934,11 @@ local function createPlayerESP(player)
         nameLabel.TextStrokeTransparency = 0.2
         nameLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
         nameLabel.Font = Enum.Font.GothamBold
-        nameLabel.TextSize = 13
+        nameLabel.TextSize = espConfig.textSize
         nameLabel.Visible = playerESPVars.Name
         nameLabel.Parent = frame
 
-        local toolLabel = Instance.new("TextLabel")
+        toolLabel = Instance.new("TextLabel")
         toolLabel.Name = "ToolLabel"
         toolLabel.Size = UDim2.new(1, 0, 0.25, 0)
         toolLabel.Position = UDim2.new(0, 0, 0.3, 0)
@@ -891,11 +948,11 @@ local function createPlayerESP(player)
         toolLabel.TextStrokeTransparency = 0.2
         toolLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
         toolLabel.Font = Enum.Font.Gotham
-        toolLabel.TextSize = 11
+        toolLabel.TextSize = math.max(espConfig.textSize - 2, 8)
         toolLabel.Visible = playerESPVars.Name
         toolLabel.Parent = frame
 
-        local healthLabel = Instance.new("TextLabel")
+        healthLabel = Instance.new("TextLabel")
         healthLabel.Name = "HealthLabel"
         healthLabel.Size = UDim2.new(1, 0, 0.2, 0)
         healthLabel.Position = UDim2.new(0, 0, 0.55, 0)
@@ -905,11 +962,11 @@ local function createPlayerESP(player)
         healthLabel.TextStrokeTransparency = 0.2
         healthLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
         healthLabel.Font = Enum.Font.GothamBold
-        healthLabel.TextSize = 11
+        healthLabel.TextSize = math.max(espConfig.textSize - 2, 8)
         healthLabel.Visible = playerESPVars.Health
         healthLabel.Parent = frame
 
-        local distLabel = Instance.new("TextLabel")
+        distLabel = Instance.new("TextLabel")
         distLabel.Name = "DistLabel"
         distLabel.Size = UDim2.new(1, 0, 0.2, 0)
         distLabel.Position = UDim2.new(0, 0, 0.78, 0)
@@ -919,7 +976,7 @@ local function createPlayerESP(player)
         distLabel.TextStrokeTransparency = 0.2
         distLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
         distLabel.Font = Enum.Font.GothamBold
-        distLabel.TextSize = 11
+        distLabel.TextSize = math.max(espConfig.textSize - 2, 8)
         distLabel.Visible = playerESPVars.Distance
         distLabel.Parent = frame
 
@@ -928,49 +985,64 @@ local function createPlayerESP(player)
         espTable.ToolLabel = toolLabel
         espTable.HealthLabel = healthLabel
         espTable.DistLabel = distLabel
+    end
 
-        local connection
-        connection = RunService.RenderStepped:Connect(function()
-            if not player or not player.Parent then
-                connection:Disconnect()
-                return
-            end
-            local c = player.Character
-            if not c or not c.Parent then return end
-            local r = c:FindFirstChild("HumanoidRootPart")
-            if not r then return end
+    -- [FIX] Always-on connection: culls by distance regardless of which labels are
+    --       enabled, auto-restores destroyed Highlight, self-cleans on player leave
+    local connection
+    connection = RunService.Heartbeat:Connect(function()
+        if not player or not player.Parent then
+            connection:Disconnect()
+            return
+        end
+        local c = player.Character
+        if not c or not c.Parent then return end
+        local r = c:FindFirstChild("HumanoidRootPart")
+        if not r then return end
 
-            if toolLabel and toolLabel.Visible and toolLabel.Parent then
+        local myChar = LocalPlayer.Character
+        local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+        if not myRoot then return end
+        local dist = (myRoot.Position - r.Position).Magnitude
+        local maxDist = Options and Options.ESPMaxDistance and Options.ESPMaxDistance.Value or 99999
+        local visible = dist <= maxDist
+
+        -- Auto-restore highlight
+        if playerESPVars.Chams and (not espTable.Highlight or not espTable.Highlight.Parent) then
+            local h = Instance.new("Highlight")
+            h.Name = "PlayerESP_Highlight"
+            h.Adornee = c
+            h.FillColor = Color3.fromRGB(0, 100, 255)
+            h.FillTransparency = espConfig.fillTransparency
+            h.OutlineColor = Color3.fromRGB(100, 180, 255)
+            h.OutlineTransparency = espConfig.outlineTransparency
+            h.Parent = c
+            espTable.Highlight = h
+        elseif espTable.Highlight and espTable.Highlight.Parent then
+            espTable.Highlight.Enabled = visible
+        end
+
+        if billboard and billboard.Parent then
+            billboard.Enabled = visible
+            if toolLabel and playerESPVars.Name then
                 local tool = c:FindFirstChildOfClass("Tool")
                 toolLabel.Text = tool and ("[ " .. tool.Name .. " ]") or ""
             end
-
-            if healthLabel and healthLabel.Visible and healthLabel.Parent then
+            if healthLabel and playerESPVars.Health then
                 local humanoid = c:FindFirstChildOfClass("Humanoid")
                 if humanoid then
-                    local health = math.floor(humanoid.Health)
-                    healthLabel.Text = health .. " HP"
+                    healthLabel.Text = math.floor(humanoid.Health) .. " HP"
                     healthLabel.TextColor3 = getHealthColor(humanoid.Health / humanoid.MaxHealth)
                 end
             end
-
-            if distLabel and distLabel.Visible and distLabel.Parent then
-                local myChar = LocalPlayer.Character
-                local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
-                if myRoot then
-                    local dist = (myRoot.Position - r.Position).Magnitude
-                    local maxDist = Options and Options.ESPMaxDistance and Options.ESPMaxDistance.Value or 99999
-                    distLabel.Text = math.floor(dist) .. "m"
-                    distLabel.TextColor3 = getDistanceColor(dist)
-                    local visible = dist <= maxDist
-                    if billboard.Enabled ~= visible then billboard.Enabled = visible end
-                    if espTable.Highlight then espTable.Highlight.Enabled = visible end
-                end
+            if distLabel and playerESPVars.Distance then
+                distLabel.Text = math.floor(dist) .. "m"
+                distLabel.TextColor3 = getDistanceColor(dist)
             end
-        end)
-        espTable.DistanceConnection = connection
-        table.insert(connections, connection)
-    end
+        end
+    end)
+    espTable.DistanceConnection = connection
+    table.insert(connections, connection)
 
     local charAddedConn = player.CharacterAdded:Connect(function()
         if playerESPVars.ESP then
@@ -1015,8 +1087,16 @@ local function setupMobListeners()
     if not charactersFolder or mobListenersSetup then return end
     mobListenersSetup = true
     local childAddedConn = charactersFolder.ChildAdded:Connect(function(child)
-        if mobOptions.ESP and table.find(mobNames, child.Name) then
-            createMobESP(child)
+        if mobOptions.ESP and child:IsA("Model") then
+            -- Exclude real player characters
+            local playerCharSet = {}
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p.Character then playerCharSet[p.Character] = true end
+            end
+            if not playerCharSet[child] then
+                task.wait(0.2)  -- [FIX] Wait for HumanoidRootPart to replicate
+                createMobESP(child)
+            end
         end
     end)
     table.insert(connections, childAddedConn)
@@ -1031,17 +1111,18 @@ setupMobListeners()
 local function setupStructureListeners()
     if not structuresFolder or structureListenersSetup then return end
     structureListenersSetup = true
-    local childAddedConn = structuresFolder.ChildAdded:Connect(function(child)
-        if structureESPVars.ESP and table.find(structureNames, child.Name) then
+    local descendantAddedConn = structuresFolder.DescendantAdded:Connect(function(child)
+        if structureESPVars.ESP and child:IsA("Model") and table.find(structureNames, child.Name) then
+            task.wait(0.2)  -- [FIX] Wait for PrimaryPart to replicate
             createStructureESP(child)
         end
     end)
-    table.insert(connections, childAddedConn)
+    table.insert(connections, descendantAddedConn)
 
-    local childRemovedConn = structuresFolder.ChildRemoved:Connect(function(child)
+    local descendantRemovingConn = structuresFolder.DescendantRemoving:Connect(function(child)
         removeStructureESP(child)
     end)
-    table.insert(connections, childRemovedConn)
+    table.insert(connections, descendantRemovingConn)
 end
 setupStructureListeners()
 
@@ -1311,6 +1392,8 @@ end
 
 -- Collect all valid kill aura targets within range, sorted by chosen priority.
 -- Returns an array of { mob, dist, health, maxHealth } tables.
+-- [FIX] Only targets known mob types (mobNames whitelist).
+--       Explicitly excludes ALL player characters so friendly-fire is impossible.
 local function findTargetsInRange(range)
     local char = LocalPlayer.Character
     if not char then return {} end
@@ -1318,11 +1401,25 @@ local function findTargetsInRange(range)
     if not hrp then return {} end
     if not charactersFolder then return {} end
 
+    -- Build a fast lookup set of every player's current character
+    -- so we can exclude them in O(1) per iteration.
+    local playerCharSet = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Character then
+            playerCharSet[p.Character] = true
+        end
+    end
+
     local targets = {}
     local myPos   = hrp.Position
 
     for _, mob in ipairs(charactersFolder:GetChildren()) do
+        -- Skip own character
         if mob == char then continue end
+        -- Skip every real player character (looked up from Players service)
+        -- Everything else in workspace.Characters is a mob/enemy
+        if playerCharSet[mob] then continue end
+
         local mobHRP = mob:FindFirstChild("HumanoidRootPart")
         local mobHum = mob:FindFirstChildOfClass("Humanoid")
         if not mobHRP or not mobHum then continue end
@@ -1424,7 +1521,7 @@ local function startKillAura()
         if setsimulationradius then setsimulationradius(1000, 1000) end
     end)
 
-    killAuraConn = RunService.RenderStepped:Connect(function()
+    killAuraConn = RunService.Heartbeat:Connect(function()
         if not Toggles.KillAura or not Toggles.KillAura.Value then
             killAuraCurrentTarget = nil
             if killAuraIndicatorLine   then killAuraIndicatorLine.Visible   = false end
@@ -1521,8 +1618,12 @@ local function startKillAura()
             if swing and hitTargets then
                 local s1, e1 = pcall(function() swing:FireServer() end)
                 if s1 then
+                    -- [FIX] Record swing time immediately after Swing fires.
+                    -- If HitTargets errors the cooldown is still respected,
+                    -- preventing rapid-fire Swing spam that the server will reject.
+                    killAuraLastSwing = now
+                    attackSuccess = true
                     local s2, e2 = pcall(function() hitTargets:FireServer(mobModels) end)
-                    attackSuccess = s2
                     if not s2 then warn("[KillAura] HitTargets error: " .. tostring(e2)) end
                 else
                     warn("[KillAura] Swing error: " .. tostring(e1))
@@ -1534,7 +1635,7 @@ local function startKillAura()
                 if not s then warn("[KillAura] RemoteClick error: " .. tostring(e)) end
             end
 
-            if attackSuccess then
+            if attackSuccess and killAuraLastSwing ~= now then
                 killAuraLastSwing = now
             end
         end)
@@ -2410,113 +2511,226 @@ local function startRemoteSpy()
 end
 
 -- ============================================
--- AUTO PICKUP FUNCTIONS
+-- AUTO PICKUP  (FE Multi-Vector, rebuilt)
+-- Four independent pickup strategies, each toggle-able:
+--
+--  A  Remote     – FireServer(PickUpItem + AdjustBackpack) directly.
+--                  Fast and clean; works when the server is lenient on
+--                  distance checks or the item is already nearby.
+--
+--  B  Touch      – firetouchinterest(hrp, itemPart) — simulates the
+--                  player’s HumanoidRootPart physically touching the
+--                  item part. Fires the Touched handler server-side in
+--                  Potassium/synapse-compatible executors.
+--
+--  C  Prompt     – fireproximityprompt(prompt) — triggers ProximityPrompt
+--                  on items that expose one instead of (or in addition to)
+--                  a Touched handler.
+--
+--  D  Teleport   – Moves the item’s BaseParts to the player’s CFrame
+--                  client-side before firing remotes + touch. Bypasses
+--                  any server-side distance check because the item is
+--                  physically on top of the player when the remote fires.
+--                  Most powerful method; enable as first step to test.
+--
+-- Enable combinations to find the minimum set that works in STA.
 -- ============================================
-local ammoItems = {
-    ["Long Ammo"] = true,
-    ["Medium Ammo"] = true,
-    ["Pistol Ammo"] = true,
-    ["Shells"] = true,
-    ["Ammo Box"] = true,
-}
+local autoPickupActive  = false
+local autoPickupThread  = nil
+local autoPickupAttempts = {}  -- [item ref] = last attempt tick
 
-local stopAutoPickup  -- Forward declaration (defined below)
-local autoPickupActive = false
+local function stopAutoPickup()
+    autoPickupActive = false
+    if autoPickupThread then
+        pcall(function() task.cancel(autoPickupThread) end)
+        autoPickupThread = nil
+    end
+    -- Restore simulation radius in case Method A raised it
+    pcall(function() if setsimulationradius then setsimulationradius(50, 300) end end)
+    autoPickupAttempts = {}
+end
 
 local function startAutoPickup()
     stopAutoPickup()
     autoPickupActive = true
 
-    -- Use task.spawn loop instead of Heartbeat to avoid coroutine pileup:
-    -- Heartbeat + task.wait() inside = ~60 stacked coroutines/s all spamming remotes.
-    autoPickupConnection = task.spawn(function()
-        -- Per-item cooldown: don't re-fire a remote for an item we already tried this tick
-        local itemCooldowns = {}
+    -- [Method A] Raise simulation radius so the server accepts
+    -- PickUpItem calls from further away (Potassium executor API)
+    pcall(function() if setsimulationradius then setsimulationradius(2048, 2048) end end)
 
-        while autoPickupActive and Toggles.AutoPickup.Value do
+    autoPickupThread = task.spawn(function()
+        while autoPickupActive and Toggles.AutoPickup and Toggles.AutoPickup.Value do
             local char = LocalPlayer.Character
-            local rootPart = char and char:FindFirstChild("HumanoidRootPart")
-            if not rootPart or not droppedItemsFolder then
-                task.wait(0.5)
-                continue
+            local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+            if not hrp or not droppedItemsFolder then task.wait(0.5) continue end
+
+            local myPos    = hrp.Position
+            local radius   = Options.AutoPickupRadius  and Options.AutoPickupRadius.Value  or 20
+            local allItems = Toggles.AutoPickupAll     and Toggles.AutoPickupAll.Value
+            local whitelist  = Options.AutoPickupWhitelist and Options.AutoPickupWhitelist.Value or {}
+            local blacklist  = Options.AutoPickupBlacklist and Options.AutoPickupBlacklist.Value or {}
+
+            -- Pause inside workspace.Map.Tiles.Center (any height: above, on, below).
+            -- The toggle stays ON; we simply skip the entire sweep while inside.
+            local centerTile = Workspace:FindFirstChild("Map")
+                and Workspace.Map:FindFirstChild("Tiles")
+                and Workspace.Map.Tiles:FindFirstChild("Center")
+            if centerTile then
+                local ok, cf, size = pcall(function() return centerTile:GetBoundingBox() end)
+                if ok and cf and size then
+                    local localPos = cf:PointToObjectSpace(myPos)
+                    if math.abs(localPos.X) <= size.X / 2 and math.abs(localPos.Z) <= size.Z / 2 then
+                        task.wait(0.5) continue  -- inside Center tile, pause all methods
+                    end
+                end
             end
 
-            local radius       = Options.PickupRadius.Value
-            local pos          = rootPart.Position
-            local allSelected  = Toggles.AllItems.Value
-            local selectedItems = Options.ItemWhitelist.Value
-            local now          = tick()
+            -- Determine which methods are enabled (default all on if toggles not yet created)
+            local useRemote = not Toggles.AutoPickupMethodRemote or Toggles.AutoPickupMethodRemote.Value
+            local useTouch  = not Toggles.AutoPickupMethodTouch  or Toggles.AutoPickupMethodTouch.Value
+            local usePrompt = not Toggles.AutoPickupMethodPrompt or Toggles.AutoPickupMethodPrompt.Value
 
             for _, item in ipairs(droppedItemsFolder:GetChildren()) do
                 if not autoPickupActive then break end
+                if not item.Parent then continue end
 
                 -- Whitelist filter
-                if not allSelected then
-                    if not selectedItems[item.Name] then continue end
-                end
-
-                -- Per-item cooldown (0.5 s) — prevents re-firing every loop tick
-                if itemCooldowns[item] and (now - itemCooldowns[item]) < 0.5 then continue end
+                if not allItems and not whitelist[item.Name] then continue end
 
                 local mainPart = item.PrimaryPart or getItemMainPart(item)
                 if not mainPart then continue end
 
-                local dist = (mainPart.Position - pos).Magnitude
+                local dist = (mainPart.Position - myPos).Magnitude
                 if dist > radius then continue end
 
-                -- Mark cooldown before firing (so even if item disappears we don't retry immediately)
-                itemCooldowns[item] = now
+                -- Per-item rate-limit: don’t hammer the same item every frame
+                local now = tick()
+                if autoPickupAttempts[item] and (now - autoPickupAttempts[item]) < 0.35 then continue end
+                autoPickupAttempts[item] = now
 
-                -- [FIX] firetouchinterest: correct arg order (hrp, itemPart, touchType 0/1)
-                pcall(function()
-                    if firetouchinterest then
-                        firetouchinterest(rootPart, mainPart, 0)
-                        firetouchinterest(rootPart, mainPart, 1)
+                -- ==================================================
+                -- METHOD A: Direct PickUpItem + AdjustBackpack remote
+                -- Blacklist only blocks pickUpItemRemote (prevents eating food);
+                -- adjustBackpackRemote always fires so the item is still stored.
+                -- ==================================================
+                if useRemote then
+                    if not blacklist[item.Name] then
+                        pcall(function()
+                            if pickUpItemRemote then pickUpItemRemote:FireServer(item) end
+                        end)
                     end
-                end)
+                    pcall(function()
+                        if adjustBackpackRemote then adjustBackpackRemote:FireServer(item) end
+                    end)
+                end
 
-                -- Fire every available pickup remote
-                pcall(function()
-                    if ammoItems[item.Name] and pickUpItemRemote then
-                        pickUpItemRemote:FireServer(item)
-                    end
-                    if adjustBackpackRemote then
-                        adjustBackpackRemote:FireServer(item)
-                    end
-                end)
+                -- ==================================================
+                -- METHOD B: firetouchinterest (Touched event sim)
+                -- ==================================================
+                if useTouch then
+                    pcall(function()
+                        if firetouchinterest then
+                            firetouchinterest(hrp, mainPart, 0)
+                            firetouchinterest(hrp, mainPart, 1)
+                        end
+                    end)
+                end
 
-                -- ProximityPrompt supplemental
-                pcall(function()
-                    if fireproximityprompt then
-                        local prompt = item:FindFirstChildWhichIsA("ProximityPrompt", true)
-                        if prompt then fireproximityprompt(prompt) end
-                    end
-                end)
+                -- ==================================================
+                -- METHOD C: ProximityPrompt fire
+                -- ==================================================
+                if usePrompt then
+                    pcall(function()
+                        if fireproximityprompt then
+                            local prompt = item:FindFirstChildWhichIsA("ProximityPrompt", true)
+                            if prompt then fireproximityprompt(prompt) end
+                        end
+                    end)
+                end
 
-                task.wait(0.05)  -- small gap between items in the same sweep (safe here in task.spawn)
+                task.wait()  -- yield once per item to keep the game responsive
             end
 
-            -- Purge cooldown entries for items that are gone from the world
-            for item in pairs(itemCooldowns) do
-                if not item.Parent then
-                    itemCooldowns[item] = nil
+            -- Clean up attempt-map for items no longer in the world
+            for itemRef in pairs(autoPickupAttempts) do
+                if not itemRef.Parent then
+                    autoPickupAttempts[itemRef] = nil
                 end
             end
 
-            task.wait(0.15)  -- delay between full sweeps
+            task.wait(0.1)  -- scan interval
         end
 
         autoPickupActive = false
+        pcall(function() if setsimulationradius then setsimulationradius(50, 300) end end)
     end)
 end
 
-stopAutoPickup = function()
-    autoPickupActive = false
-    if autoPickupConnection then
-        -- autoPickupConnection is now a thread, not an RBXScriptConnection
-        pcall(function() task.cancel(autoPickupConnection) end)
-        autoPickupConnection = nil
+-- ============================================
+-- REPAIR AURA
+-- Fires the "Repair" RemoteEvent found inside the equipped Repair Hammer.
+-- Only activates when the Repair Hammer is held; targets the nearest
+-- structure within 30 studs at a rate controlled by the slider.
+-- ============================================
+local function stopRepairAura()
+    if repairAuraConn then
+        repairAuraConn:Disconnect()
+        repairAuraConn = nil
     end
+end
+
+local function startRepairAura()
+    stopRepairAura()
+    local lastFire = 0
+
+    repairAuraConn = RunService.Heartbeat:Connect(function()
+        if not Toggles.RepairAura or not Toggles.RepairAura.Value then return end
+
+        -- Rate limiter: honours the slider (1–10 fires per second)
+        local rate     = Options.RepairAuraRate and Options.RepairAuraRate.Value or 1
+        local interval = 1 / rate
+        local now      = tick()
+        if now - lastFire < interval then return end
+
+        -- Repair Hammer must be equipped
+        local char = LocalPlayer.Character
+        if not char then return end
+        local tool = char:FindFirstChildOfClass("Tool")
+        if not tool or tool.Name ~= "Repair Hammer" then return end
+
+        -- Look for the "Repair" RemoteEvent inside the tool
+        local repairRemote = tool:FindFirstChild("Repair")
+        if not repairRemote then return end
+
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+        local myPos   = hrp.Position
+        local maxDist = Options.RepairAuraRange and Options.RepairAuraRange.Value or 30
+
+        -- Find the nearest structure within range
+        if not structuresFolder then return end
+        local nearest     = nil
+        local nearestDist = math.huge
+        for _, child in ipairs(structuresFolder:GetDescendants()) do
+            if child:IsA("Model") then
+                local part = child.PrimaryPart or getItemMainPart(child)
+                if part then
+                    local dist = (myPos - part.Position).Magnitude
+                    if dist <= maxDist and dist < nearestDist then
+                        nearestDist = dist
+                        nearest     = child
+                    end
+                end
+            end
+        end
+
+        if nearest then
+            lastFire = now
+            pcall(function()
+                repairRemote:FireServer(nearest)
+            end)
+        end
+    end)
 end
 
 -- ============================================
@@ -2649,7 +2863,55 @@ LocalPlayer.CharacterAdded:Connect(function(char)
     task.wait(0.5)
     if Toggles.Fly and Toggles.Fly.Value then startFly() end
     if Toggles.AutoSprint and Toggles.AutoSprint.Value then startAutoSprint() end
+    if Toggles.AutoPickup and Toggles.AutoPickup.Value then startAutoPickup() end
 end)
+
+-- ============================================
+-- ESP UTILITY FUNCTIONS
+-- applyESPTextSize  – live-update all label font sizes
+-- applyESPTransparency – live-update all highlight transparencies
+-- ============================================
+local function applyESPTextSize(size)
+    espConfig.textSize = size
+    local small = math.max(size - 2, 8)
+    for _, sys in pairs(espSystems) do
+        for _, esp in pairs(sys.instances) do
+            if esp.NameLabel then esp.NameLabel.TextSize = size end
+            if esp.DistLabel  then esp.DistLabel.TextSize  = small end
+        end
+    end
+    for _, esp in pairs(mobESPInstances) do
+        if esp.NameLabel then esp.NameLabel.TextSize = size end
+        if esp.DistLabel  then esp.DistLabel.TextSize  = small end
+    end
+    for _, esp in pairs(structureESPInstances) do
+        if esp.NameLabel then esp.NameLabel.TextSize = size end
+        if esp.DistLabel  then esp.DistLabel.TextSize  = small end
+    end
+    for _, esp in pairs(playerESPInstances) do
+        if esp.NameLabel   then esp.NameLabel.TextSize   = size  end
+        if esp.ToolLabel   then esp.ToolLabel.TextSize   = small end
+        if esp.HealthLabel then esp.HealthLabel.TextSize = small end
+        if esp.DistLabel   then esp.DistLabel.TextSize   = small end
+    end
+end
+
+local function applyESPTransparency()
+    local fillT    = espConfig.fillTransparency
+    local outlineT = espConfig.outlineTransparency
+    local function updateH(esp)
+        if esp.Highlight and esp.Highlight.Parent then
+            esp.Highlight.FillTransparency    = fillT
+            esp.Highlight.OutlineTransparency = outlineT
+        end
+    end
+    for _, sys in pairs(espSystems) do
+        for _, esp in pairs(sys.instances) do updateH(esp) end
+    end
+    for _, esp in pairs(mobESPInstances)       do updateH(esp) end
+    for _, esp in pairs(structureESPInstances) do updateH(esp) end
+    for _, esp in pairs(playerESPInstances)    do updateH(esp) end
+end
 
 -- ============================================
 -- UI: VISUALS TAB
@@ -2674,7 +2936,7 @@ end
 local espSettingsGroup = Tabs.Visuals:AddLeftGroupbox("ESP Settings", "settings")
 
 espSettingsGroup:AddSlider("ESPMaxDistance", {
-    Text = "Max Distance", Default = 500, Min = 50, Max = 2000, Rounding = 0, Suffix = " studs",
+    Text = "Max Distance", Default = 300, Min = 50, Max = 2000, Rounding = 0, Suffix = " studs",
     Tooltip = "Maximum render distance shared by all ESP systems.",
     Callback = function()
         refreshMobESP(); refreshPlayerESP(); refreshStructureESP()
@@ -2683,6 +2945,25 @@ espSettingsGroup:AddSlider("ESPMaxDistance", {
 })
 espSettingsGroup:AddToggle("ESPShowNames",    { Text = "Show Names",    Default = false, Tooltip = "Show labels on all ESPs.", Callback = function(s) setAllESPNames(s)     end })
 espSettingsGroup:AddToggle("ESPShowDistance", { Text = "Show Distance", Default = false, Tooltip = "Show distance on all ESPs.", Callback = function(s) setAllESPDistance(s) end })
+
+-- [FIX #3] Text Size slider — live-updates all ESP label sizes
+espSettingsGroup:AddSlider("ESPTextSize", {
+    Text = "Text Size", Default = 10, Min = 8, Max = 24, Rounding = 0, Suffix = "px",
+    Tooltip = "Font size for all ESP labels. Lower = less cluttered screen.",
+    Callback = function(v) applyESPTextSize(v) end,
+})
+-- [FIX #4] Fill Transparency — controls how solid the Chams highlight fill is
+espSettingsGroup:AddSlider("ESPFillTransparency", {
+    Text = "Fill Transparency", Default = 40, Min = 0, Max = 100, Rounding = 0, Suffix = "%",
+    Tooltip = "Chams fill opacity for all ESP. 0% = fully solid, 100% = invisible fill (outline only).",
+    Callback = function(v) espConfig.fillTransparency = v / 100; applyESPTransparency() end,
+})
+-- [FIX #4] Outline Transparency
+espSettingsGroup:AddSlider("ESPOutlineTransparency", {
+    Text = "Outline Transparency", Default = 0, Min = 0, Max = 100, Rounding = 0, Suffix = "%",
+    Tooltip = "Chams outline opacity for all ESP. 0% = fully solid outline.",
+    Callback = function(v) espConfig.outlineTransparency = v / 100; applyESPTransparency() end,
+})
 
 -- Mob ESP (Left)
 local mobESPGroup = Tabs.Visuals:AddLeftGroupbox("Mob ESP", "eye")
@@ -2695,12 +2976,7 @@ playerESPGroup:AddToggle("PlayerESP",    { Text = "Player ESP",   Default = fals
 playerESPGroup:AddToggle("PlayerChams",  { Text = "Chams",         Default = false, Callback = function(s) playerESPVars.Chams  = s; refreshPlayerESP() end })
 playerESPGroup:AddToggle("PlayerHealth", { Text = "Show Health",   Default = false, Tooltip = "Health bar + HP above players.", Callback = function(s) playerESPVars.Health = s; refreshPlayerESP() end })
 
--- Structure ESP (Left)
-local structureESPGroup = Tabs.Visuals:AddLeftGroupbox("Structure ESP", "castle")
-structureESPGroup:AddToggle("StructureESP",   { Text = "Structure ESP", Default = false, Callback = function(s) structureESPVars.ESP   = s; refreshStructureESP() end })
-structureESPGroup:AddToggle("StructureChams", { Text = "Chams",          Default = false, Callback = function(s) structureESPVars.Chams = s; refreshStructureESP() end })
-
--- Item ESP (Right) — all 7 categories in one groupbox
+-- Item ESP (Right) — all categories + structures in one groupbox
 local itemESPGroup = Tabs.Visuals:AddRightGroupbox("Item ESP", "package")
 
 itemESPGroup:AddToggle("ItemESPChams", {
@@ -2723,11 +2999,27 @@ local itemESPDefs = {
     { key = "Ability",  text = "Abilities ESP",   tip = "Abilities (Purple)" },
 }
 for _, d in ipairs(itemESPDefs) do
+    -- [FIX #4] Color picker chained to each category toggle for live color control
     itemESPGroup:AddToggle(d.key .. "ESPEnabled", {
         Text = d.text, Default = false, Tooltip = d.tip,
         Callback = function(s) espSystems[d.key].vars.ESP = s; espSystems[d.key].refresh() end,
+    }):AddColorPicker(d.key .. "ESPColor", {
+        Default = espSystems[d.key].colors.fill,
+        Title = d.text .. " Color",
+        Callback = function(c)
+            espSystems[d.key].colors.fill = c
+            for _, esp in pairs(espSystems[d.key].instances) do
+                if esp.Highlight and esp.Highlight.Parent then esp.Highlight.FillColor = c end
+                if esp.NameLabel then esp.NameLabel.TextColor3 = c end
+            end
+        end,
     })
 end
+
+itemESPGroup:AddDivider()
+itemESPGroup:AddLabel("Structures")
+itemESPGroup:AddToggle("StructureESP",   { Text = "Structure ESP", Default = false, Callback = function(s) structureESPVars.ESP   = s; refreshStructureESP() end })
+itemESPGroup:AddToggle("StructureChams", { Text = "Chams",         Default = false, Callback = function(s) structureESPVars.Chams = s; refreshStructureESP() end })
 
 end -- Visuals Tab local scope
 
@@ -3064,17 +3356,17 @@ end -- Combat Tab local scope
 -- ============================================
 do -- Exploits Tab local scope
 
--- LEFT: Auto Pickup (proximity-based, picks up nearby items)
-local autoPickupGroup = Tabs.Exploits:AddLeftGroupbox("Auto Pickup")
+-- LEFT: Auto Pickup (proximity-based, no player teleport)
+local autoPickupGroup = Tabs.Exploits:AddLeftGroupbox("Auto Pickup", "magnet")
 
 autoPickupGroup:AddToggle("AutoPickup", {
     Text = "Auto Pickup",
     Default = false,
-    Tooltip = "Ammo auto-picks up. Other items require Backpack tool equipped.",
+    Tooltip = "Automatically picks up items within radius. Uses up to 4 FE methods in parallel.",
     Callback = function(state)
         if state then
             startAutoPickup()
-            Library:Notify({ Title = "Auto Pickup", Description = "Started (" .. #itemNames .. " items tracked)", Time = 2 })
+            Library:Notify({ Title = "Auto Pickup", Description = "Active – " .. (Options.AutoPickupRadius and Options.AutoPickupRadius.Value or 20) .. " stud radius", Time = 2 })
         else
             stopAutoPickup()
             Library:Notify({ Title = "Auto Pickup", Description = "Stopped", Time = 2 })
@@ -3082,33 +3374,78 @@ autoPickupGroup:AddToggle("AutoPickup", {
     end,
 })
 
-autoPickupGroup:AddSlider("PickupRadius", {
-    Text = "Pickup Radius",
-    Default = 15,
-    Min = 1,
-    Max = 50,
+autoPickupGroup:AddSlider("AutoPickupRadius", {
+    Text = "Radius",
+    Default = 20,
+    Min = 5,
+    Max = 35,
     Rounding = 0,
     Suffix = " studs",
+    Tooltip = "How far away items are picked up. Combine methods A+B+C for best coverage at range.",
 })
 
-autoPickupGroup:AddToggle("AllItems", {
-    Text = "Pick Up All Items",
+autoPickupGroup:AddToggle("AutoPickupAll", {
+    Text = "All Items",
     Default = false,
-    Tooltip = "When enabled, all items within radius are picked up regardless of filter",
+    Tooltip = "Pick up every item in the folder. Disable to use the whitelist filter below.",
 })
 
 autoPickupGroup:AddDivider()
-autoPickupGroup:AddLabel("Item Filter (80+ items)")
-autoPickupGroup:AddDropdown("ItemWhitelist", {
+autoPickupGroup:AddLabel("FE Methods (combine to test)", { DoesWrap = true })
+
+autoPickupGroup:AddToggle("AutoPickupMethodRemote", {
+    Text = "A – Remote (PickUpItem)",
+    Default = true,
+    Tooltip = "FireServer on Remotes.Interaction.PickUpItem + AdjustBackpack. Fast, works when server has no strict distance check.",
+})
+
+autoPickupGroup:AddToggle("AutoPickupMethodTouch", {
+    Text = "B – Touch Simulate",
+    Default = true,
+    Tooltip = "firetouchinterest(HRP, itemPart) – simulates the player touching the item part. Fires server-side Touched handlers.",
+})
+
+autoPickupGroup:AddToggle("AutoPickupMethodPrompt", {
+    Text = "C – ProximityPrompt",
+    Default = true,
+    Tooltip = "fireproximityprompt(prompt) – fires the item's ProximityPrompt if one exists. Useful for items using prompt-based pickup.",
+})
+
+autoPickupGroup:AddDivider()
+autoPickupGroup:AddLabel("Item Whitelist (when All Items is off)")
+autoPickupGroup:AddDropdown("AutoPickupWhitelist", {
     Values = itemNames,
     Default = 1,
     Multi = true,
-    Text = "Item Whitelist",
-    Tooltip = "Select which items to pick up. Only applies when 'Pick Up All Items' is off.",
+    Text = "Whitelist",
+    Tooltip = "Items to pick up. Only active when 'All Items' is disabled.",
     Searchable = true,
 })
 
-autoPickupGroup:AddLabel("Tip: Equip Backpack for non-ammo items", { DoesWrap = true })
+autoPickupGroup:AddDivider()
+autoPickupGroup:AddLabel("Blacklist (blocks PickUpItem remote)")
+autoPickupGroup:AddDropdown("AutoPickupBlacklist", {
+    Values = itemNames,
+    Default = {
+        -- Food (auto-consume on pickup)
+        "Chips", "Carrot", "Bloxiade", "Beans", "MRE", "Bloxy Cola",
+        -- Fuel
+        "Nuclear Fuel", "Refined Fuel", "Fuel",
+        -- Misc (not in Bring Pickup)
+        "Power Armor Arm", "Power Armor Core", "Radio Tower Part",
+        -- Resources
+        "AC", "Battery", "Battery Pack", "Bucket", "Dumbell", "Exhaust Pipe",
+        "Reactor Component", "Refined Metal", "Satellite Dish", "Scrap", "Screws",
+        "Spatula", "Tray", "TV", "Watch", "Zombie Heart",
+        -- Abilities
+        "Airstrike", "Attack Order", "Call of the Dead", "Summon Brute",
+        "Summon Zombies", "Taunt", "The Future", "The Past", "The Present",
+    },
+    Multi = true,
+    Text = "Blacklist",
+    Tooltip = "Blacklisted items skip the PickUpItem remote. AdjustBackpack still fires so they are stored. Pre-selected: all items not in the Bring Pickup filter (Food, Fuel, Resources, Misc, Abilities).",
+    Searchable = true,
+})
 
 -- RIGHT: Bring Pickup Item (E-key items: Guns, Melee, Medical, Ammo, etc.)
 local bringPickupGroup = Tabs.Exploits:AddRightGroupbox("Bring Pickup Item", "download")
@@ -3151,6 +3488,46 @@ bringPickupGroup:AddDropdown("BringPickupWhitelist", {
     Tooltip = "Only active when 'All Pickup Items' is off.",
     Searchable = true,
 })
+
+-- RIGHT (second): Repair Aura
+local repairAuraGroup = Tabs.Exploits:AddRightGroupbox("Repair Aura", "wrench")
+
+repairAuraGroup:AddToggle("RepairAura", {
+    Text    = "Repair Aura",
+    Default = false,
+    Tooltip = "Automatically repairs structures within range. Repair Hammer must be equipped.",
+    Callback = function(state)
+        if state then
+            startRepairAura()
+            Library:Notify({ Title = "Repair Aura", Description = "Active – repairing structures within " .. (Options.RepairAuraRange and Options.RepairAuraRange.Value or 30) .. " studs", Time = 2 })
+        else
+            stopRepairAura()
+            Library:Notify({ Title = "Repair Aura", Description = "Stopped", Time = 2 })
+        end
+    end,
+})
+
+repairAuraGroup:AddSlider("RepairAuraRange", {
+    Text     = "Range",
+    Default  = 30,
+    Min      = 5,
+    Max      = 30,
+    Rounding = 0,
+    Suffix   = " studs",
+    Tooltip  = "Maximum distance to structures that will be repaired.",
+})
+
+repairAuraGroup:AddSlider("RepairAuraRate", {
+    Text     = "Rate",
+    Default  = 1,
+    Min      = 1,
+    Max      = 10,
+    Rounding = 0,
+    Suffix   = "/s",
+    Tooltip  = "How many repair remote fires per second (1 = minimum, 10 = maximum).",
+})
+
+repairAuraGroup:AddLabel("Requires: Repair Hammer equipped", { DoesWrap = true })
 
 end -- Exploits Tab local scope
 
@@ -3322,6 +3699,7 @@ Library:OnUnload(function()
     -- Stop all active features
     stopAutoPickup()
     stopBringPickup()
+    stopRepairAura()
     stopFly()
     stopAutoSprint()
     stopKillAura()
@@ -3359,7 +3737,7 @@ Library:OnUnload(function()
     stopAntiAFK()
 
     Library:Notify({ Title = "SPYMM", Description = "Unloaded. Bye!", Time = 3 })
-    print("SPYMM v8.1 unloaded.")
+    print("SPYMM v8.2 unloaded.")
 end)
 
 -- ============================================
@@ -3442,10 +3820,10 @@ SaveManager:LoadAutoloadConfig()
 -- ============================================
 -- INIT NOTIFICATION
 -- ============================================
-Library:Notify({ Title = "SPYMM v8.1", Description = "Loaded! Gun|Melee|Medical|Armor|Food|Resources\nRight Shift = toggle menu.", Time = 5 })
+Library:Notify({ Title = "SPYMM v8.2", Description = "Loaded! Gun|Melee|Medical|Armor|Food|Resources\nRight Shift = toggle menu.", Time = 5 })
 
 local espCounts = { Gun="Red", Melee="Orange", Medical="Green", Armor="Blue", Food="Lime", Resource="Silver" }
-print("SPYMM v8.1 loaded | " .. #itemNames .. " items tracked | Right Shift = menu")
+print("SPYMM v8.2 loaded | " .. #itemNames .. " items tracked | Right Shift = menu")
 for cat, col in pairs(espCounts) do
     print(string.format("  %s ESP (%s) - %d items", cat, col, #espSystems[cat].items))
 end
