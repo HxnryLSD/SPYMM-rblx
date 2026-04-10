@@ -1,6 +1,6 @@
 --[[
     ====================================================================
-    SPYTERMINAL v9 — Advanced Developer Console
+    SPYTERMINAL v10 — Advanced Developer Console
     ====================================================================
     Target : StarterPlayerScripts (LocalScript)
     Toggle : DELETE key
@@ -46,7 +46,7 @@ local C = {
 
     DefW       = 680, DefH = 380, MinW = 320, MinH = 200,
     TopBarH    = 32, EvalH = 26, Margin = 12,
-    TweenT     = 0.28, SlideOff = 50, MaxLogs = 800,
+    TweenT     = 0.28, SlideOff = 50, MaxLogs = 800, MaxChars = 180000,
 
     Font       = Enum.Font.Code,
     BtnFont    = Enum.Font.GothamBold,
@@ -89,6 +89,16 @@ local function Main()
     local totalCount      = 0
     local dragMouse0, dragPos0
     local resizeMouse0, resizeSize0
+    local flushPending    = false  -- batch log flush debounce
+    local logsPendingFlush = 0    -- how many logs arrived this defer-frame
+    local logChars         = 0    -- estimated total chars of stored log entries
+    local evalHistory     = {}    -- eval command history
+    local evalHistIdx     = 0     -- current history navigation index
+    local showTimestamp   = true   -- toggle log timestamp visibility
+    local dedupLast       = nil    -- last log entry for dedup detection
+    local dedupCount      = 0      -- consecutive repeat count of last log
+    local savedFramePos   = nil    -- position saved before slide-out (Draggable)
+    local savedFrameSize  = nil    -- size saved before slide-out (preserves resize)
 
     -- UI REFS
     local gui, consoleFrame, shadowFrame
@@ -99,7 +109,9 @@ local function Main()
     local resizeHandle
     local settingsOverlay
     local positionSettingsPanel
-    local settingsConsoleVal, settingsMenuVal
+    local btnTimestamp              -- timestamp toggle button
+    local evalHistLabel             -- history index indicator in eval bar
+    local showTooltip, hideTooltip  -- tooltip helpers (assigned after GUI build)
 
     -- UTILITY
     local function viewport()
@@ -115,11 +127,11 @@ local function Main()
             .. "." .. string.format("%03d", math.floor((os.clock() % 1) * 1000))
     end
 
-    local function tag(mt)
-        if mt == Enum.MessageType.MessageWarning then
+    local function tag(msgType)
+        if msgType == Enum.MessageType.MessageWarning then
             return "WARN"
         end
-        if mt == Enum.MessageType.MessageError then
+        if msgType == Enum.MessageType.MessageError then
             return "ERR!"
         end
         return "INFO"
@@ -161,6 +173,9 @@ local function Main()
         local v  = viewport()
         local w  = consoleFrame.AbsoluteSize.X
         local h  = consoleFrame.AbsoluteSize.Y
+        -- AbsoluteSize is (0,0) before first render — fall back to defaults
+        if w < 1 then w = C.DefW end
+        if h < 1 then h = C.DefH end
         local tl = calcTopLeft(currentPreset, v, w, h, C.Margin)
         if animate and isOpen then
             local tw = TweenService:Create(consoleFrame, TweenInfo.new(
@@ -194,7 +209,7 @@ local function Main()
 
         -- Menu font — buttons
         local btns = { btnClear, btnCopy, btnAutoScroll, btnSettings,
-                       btnAll, btnWarn, btnError }
+                       btnAll, btnWarn, btnError, btnTimestamp }
         for _, b in ipairs(btns) do
             if b then
                 b.TextSize = barSz
@@ -203,6 +218,16 @@ local function Main()
     end
 
     -- LOG MANAGEMENT (dependency order — Luau has no forward hoisting)
+    local function formatLine(e)
+        local dc = e.dedupCount or 1
+        local suffix = dc > 1 and ("  [×" .. dc .. "]") or ""
+        if showTimestamp then
+            return string.format("[%s] [%s] %s%s", e.stamp, tag(e.msgType), e.text, suffix)
+        else
+            return string.format("[%s] %s%s", tag(e.msgType), e.text, suffix)
+        end
+    end
+
     local function buildText()
         local parts = {}
         local vc = 0
@@ -219,12 +244,12 @@ local function Main()
             end
             if not skip then
                 vc = vc + 1
-                table.insert(parts, string.format(
-                    "[%s] [%s] %s", e.stamp, tag(e.msgType), e.text
-                ))
+                table.insert(parts, formatLine(e))
             end
         end
         if countLabel then
+            -- totalCount reflects how many logs arrived total; #logs may be
+            -- capped at MaxLogs, so display the real received count.
             countLabel.Text = string.format("%d/%d", vc, totalCount)
         end
         return table.concat(parts, "\n")
@@ -240,20 +265,84 @@ local function Main()
         end
     end
 
+    -- Fast incremental append: adds one line without full rebuild.
+    -- Only called when no filter and no search query are active.
+    local function appendLine(entry)
+        local line = formatLine(entry)
+        local cur = logBox.Text
+        if cur == "" then
+            logBox.Text = line
+        else
+            logBox.Text = cur .. "\n" .. line
+        end
+        -- Update visible count label: fast-path is only reached when
+        -- no filter and no search are active, so all #logs entries are visible.
+        if countLabel then
+            countLabel.Text = string.format("%d/%d", #logs, totalCount)
+        end
+        if autoScroll then
+            local len = #logBox.Text
+            task.defer(function()
+                logBox.CursorPosition = len + 1
+            end)
+        end
+    end
+
     local function addLog(msg, msgType)
         totalCount = totalCount + 1
-        table.insert(logs, { stamp = stamp(), msgType = msgType, text = msg })
-        while #logs > C.MaxLogs do
-            table.remove(logs, 1)
+        -- Dedup: identical consecutive message — bump counter on last entry
+        if dedupLast and dedupLast.text == msg and dedupLast.msgType == msgType then
+            dedupCount = dedupCount + 1
+            dedupLast.dedupCount = dedupCount
+            if isOpen and not flushPending then
+                flushPending = true
+                task.defer(function()
+                    logsPendingFlush = 0
+                    flushPending = false
+                    refresh()
+                end)
+            end
+            return
         end
-        if isOpen then
-            refresh()
+        dedupCount = 1
+        local entry = { stamp = stamp(), msgType = msgType, text = msg, dedupCount = 1 }
+        dedupLast = entry
+        table.insert(logs, entry)
+        -- 22 chars = overhead of "[HH:MM:SS.mmm] [INFO] " prefix per line
+        logChars = logChars + #msg + 22
+        -- Trim from the front while over either limit
+        while #logs > C.MaxLogs or logChars > C.MaxChars do
+            local removed = table.remove(logs, 1)
+            logChars = logChars - (#removed.text + 22)
+            if dedupLast == removed then dedupLast = nil end
+        end
+        if not isOpen then
+            return
+        end
+        logsPendingFlush = logsPendingFlush + 1
+        if not flushPending then
+            flushPending = true
+            task.defer(function()
+                local burst = logsPendingFlush
+                logsPendingFlush = 0
+                flushPending = false
+                if burst == 1 and activeFilter == "All" and searchQuery == "" then
+                    -- Fast path: single log, no filter — just append the line.
+                    appendLine(entry)
+                else
+                    -- Burst or filtered: full rebuild needed.
+                    refresh()
+                end
+            end)
         end
     end
 
     local function clearLogs()
         logs = {}
         totalCount = 0
+        logChars = 0
+        dedupLast  = nil
+        dedupCount = 0
         logBox.Text = ""
         if countLabel then
             countLabel.Text = "0/0"
@@ -293,50 +382,45 @@ local function Main()
     -- ================================================================
     -- TYPEWRITER — looping animation with type / hold / erase cycle
     -- ================================================================
-    local titleText = "SPYTERMINAL"
+    local titleText    = "SPYTERMINAL"
+    local twGeneration = 0  -- incremented each time a new loop is spawned;
+                            -- old loops compare and self-terminate immediately
 
     local function setTitle(text)
         titleLabel.Text = text
     end
 
-    local function typewriterLoop()
-        while isOpen do
-            -- PHASE 1: Type characters one by one (60 ms each)
+    local function typewriterLoop(gen)
+        while isOpen and twGeneration == gen do
+            -- PHASE 1: Type characters one by one (80 ms each)
             for i = 1, #titleText do
-                if not isOpen then
-                    return
-                end
+                if not isOpen or twGeneration ~= gen then return end
                 setTitle(titleText:sub(1, i) .. "_")
-                task.wait(0.06)
+                task.wait(0.08)
             end
 
-            -- PHASE 2: Show full title for 4 seconds
+            -- PHASE 2: Show full title for 5 seconds
+            if not isOpen or twGeneration ~= gen then return end
             setTitle(titleText)
-            task.wait(4)
-            if not isOpen then
-                return
-            end
+            task.wait(5)
 
-            -- PHASE 3: Erase characters one by one (40 ms each)
+            -- PHASE 3: Erase characters one by one (55 ms each)
             for i = #titleText - 1, 0, -1 do
-                if not isOpen then
-                    return
-                end
-                if i > 0 then
-                    setTitle(titleText:sub(1, i) .. "_")
-                else
-                    setTitle("_")
-                end
-                task.wait(0.04)
+                if not isOpen or twGeneration ~= gen then return end
+                setTitle(i > 0 and (titleText:sub(1, i) .. "_") or "_")
+                task.wait(0.055)
             end
 
-            -- Brief pause before restarting
-            task.wait(0.5)
+            -- Pause before restarting
+            if not isOpen or twGeneration ~= gen then return end
+            task.wait(0.6)
         end
     end
 
     local function startTypewriter()
-        task.spawn(typewriterLoop)
+        twGeneration = twGeneration + 1
+        local gen = twGeneration
+        task.spawn(typewriterLoop, gen)
     end
 
     -- ANIMATION
@@ -346,25 +430,38 @@ local function Main()
         end
         isAnimating = true
         local v = viewport()
-        local w = C.DefW
-        local h = C.DefH
-        local tl = calcTopLeft(currentPreset, v, w, h, C.Margin)
+        -- Restore saved size (preserves any user resize); fall back to defaults
+        local w = savedFrameSize and savedFrameSize.X.Offset or C.DefW
+        local h = savedFrameSize and savedFrameSize.Y.Offset or C.DefH
+        if w < C.MinW then w = C.DefW end
+        if h < C.MinH then h = C.DefH end
         consoleFrame.Size = UDim2.fromOffset(w, h)
+        local targetPos
+        if currentPreset == "Draggable" and savedFramePos then
+            -- Restore the exact pre-close position instead of reading the
+            -- (now off-screen) AbsolutePosition that the slide-out left behind.
+            targetPos = savedFramePos
+        else
+            local tl = calcTopLeft(currentPreset, v, w, h, C.Margin)
+            targetPos = UDim2.fromOffset(tl.X, tl.Y)
+        end
+        local tx = targetPos.X.Offset
+        local ty = targetPos.Y.Offset
         local isTop = (currentPreset == "TopLeft"
                     or currentPreset == "TopRight"
                     or currentPreset == "Center")
         local startY
         if isTop then
-            startY = tl.Y - h - C.SlideOff
+            startY = ty - h - C.SlideOff
         else
-            startY = tl.Y + h + C.SlideOff
+            startY = ty + h + C.SlideOff
         end
-        consoleFrame.Position = UDim2.fromOffset(tl.X, startY)
+        consoleFrame.Position = UDim2.fromOffset(tx, startY)
         consoleFrame.Visible  = true
         syncShadow()
         local tw = TweenService:Create(consoleFrame, TweenInfo.new(
             C.TweenT, Enum.EasingStyle.Quad, Enum.EasingDirection.Out
-        ), { Position = UDim2.fromOffset(tl.X, tl.Y) })
+        ), { Position = UDim2.fromOffset(tx, ty) })
         tw.Completed:Connect(function()
             isAnimating = false
             isOpen = true
@@ -382,6 +479,10 @@ local function Main()
         if settingsOverlay then
             settingsOverlay.Visible = false
         end
+        -- Save current position and size BEFORE the slide-out tween moves the
+        -- frame off-screen — openConsole reads these back on the next show.
+        savedFramePos  = consoleFrame.Position
+        savedFrameSize = consoleFrame.Size
         local pos = consoleFrame.Position
         local h   = consoleFrame.AbsoluteSize.Y
         local isTop = (currentPreset == "TopLeft"
@@ -471,6 +572,9 @@ local function Main()
         ZIndex = 1,
     })
     consoleFrame.Parent = gui
+    new("UICorner", {
+        CornerRadius = UDim.new(0, 4),
+    }).Parent = consoleFrame
     new("UIStroke", {
         Color = C.Border,
         Thickness = 1,
@@ -485,13 +589,18 @@ local function Main()
     -- TOP BAR
     --
     -- LayoutOrder:
-    --   0 = Title label
-    --   1 = Clear       2 = Copy
-    --   3 = All         4 = Warn        5 = Error
-    --   6 = Scroll
-    --   7 = Count
-    --   8 = SearchBox   (flex-fill via UIFlexItem)
-    --   9 = Settings button
+    --   0  = Title label
+    --   5  = Divider
+    --   10 = Clear      11 = Copy
+    --   15 = Divider
+    --   20 = All        21 = Warn       22 = Err    23 = Ts
+    --   25 = Divider
+    --   30 = Scroll
+    --   35 = Divider
+    --   40 = Count
+    --   50 = SearchBox  (flex-fill via UIFlexItem)
+    --   55 = Divider
+    --   60 = Settings button
     -- ================================================================
     local topBar = new("Frame", {
         Name = "TopBar",
@@ -543,12 +652,14 @@ local function Main()
         return b
     end
 
-    local function addHover(btn, restore)
+    local function addHover(btn, restore, tip)
         btn.MouseEnter:Connect(function()
             btn.BackgroundColor3 = C.BtnHover
+            if tip and showTooltip then showTooltip(tip) end
         end)
         btn.MouseLeave:Connect(function()
             restore()
+            if hideTooltip then hideTooltip() end
         end)
         btn.MouseButton1Down:Connect(function()
             btn.BackgroundColor3 = C.BtnActive
@@ -574,15 +685,24 @@ local function Main()
     })
     titleLabel.Parent = topBar
 
-    -- Clear (1)
-    btnClear = mkBtn("Clear", "Clear", 1, 34)
-    btnClear.MouseButton1Click:Connect(clearLogs)
+    -- Clear (10)
+    btnClear = mkBtn("Clear", "Clear", 10, 34)
+    btnClear.MouseButton1Click:Connect(function()
+        clearLogs()
+        -- Brief green flash as confirmation feedback
+        btnClear.BackgroundColor3 = Color3.fromRGB(40, 160, 80)
+        task.delay(0.35, function()
+            if btnClear then
+                btnClear.BackgroundColor3 = C.BtnIdle
+            end
+        end)
+    end)
     addHover(btnClear, function()
         btnClear.BackgroundColor3 = C.BtnIdle
-    end)
+    end, "Clear logs")
 
-    -- Copy All (2)
-    btnCopy = mkBtn("Copy", "Copy", 2, 34)
+    -- Copy All (11)
+    btnCopy = mkBtn("Copy", "Copy", 11, 34)
     btnCopy.MouseButton1Click:Connect(function()
         if setclipboard then
             pcall(setclipboard, buildText())
@@ -590,12 +710,12 @@ local function Main()
     end)
     addHover(btnCopy, function()
         btnCopy.BackgroundColor3 = C.BtnIdle
-    end)
+    end, "Copy logs to clipboard")
 
-    -- Filter buttons (3-5)
-    btnAll   = mkBtn("All",   "All",   3, 26)
-    btnWarn  = mkBtn("Warn",  "Warn",  4, 36)
-    btnError = mkBtn("Error", "Err",   5, 28)
+    -- Filter buttons (20-22)
+    btnAll   = mkBtn("All",   "All",   20, 26)
+    btnWarn  = mkBtn("Warn",  "Warn",  21, 36)
+    btnError = mkBtn("Error", "Err",   22, 28)
 
     btnAll.MouseButton1Click:Connect(function()
         activeFilter = "All"
@@ -612,13 +732,13 @@ local function Main()
         updateFilters()
         refresh()
     end)
-    addHover(btnAll,   updateFilters)
-    addHover(btnWarn,  updateFilters)
-    addHover(btnError, updateFilters)
+    addHover(btnAll,   updateFilters, "Show all logs")
+    addHover(btnWarn,  updateFilters, "Filter warnings")
+    addHover(btnError, updateFilters, "Filter errors")
     updateFilters()
 
-    -- Auto-Scroll (6)
-    btnAutoScroll = mkBtn("Scroll", "Scroll:ON", 6, 60)
+    -- Auto-Scroll (30)
+    btnAutoScroll = mkBtn("Scroll", "Scroll:ON", 30, 60)
     btnAutoScroll.MouseButton1Click:Connect(function()
         autoScroll = not autoScroll
         updateAutoScroll()
@@ -626,10 +746,10 @@ local function Main()
             logBox.CursorPosition = #logBox.Text + 1
         end
     end)
-    addHover(btnAutoScroll, updateAutoScroll)
+    addHover(btnAutoScroll, updateAutoScroll, "Toggle auto-scroll")
     updateAutoScroll()
 
-    -- Log counter (7)
+    -- Log counter (40)
     countLabel = new("TextLabel", {
         Name = "Count",
         Text = "0/0",
@@ -637,8 +757,9 @@ local function Main()
         TextSize = C.BarSz,
         TextColor3 = C.Stamp,
         BackgroundTransparency = 1,
-        LayoutOrder = 7,
-        Size = UDim2.fromOffset(38, 20),
+        AutomaticSize = Enum.AutomaticSize.X,
+        LayoutOrder = 40,
+        Size = UDim2.fromOffset(0, 20),
     })
     countLabel.Parent = topBar
 
@@ -656,7 +777,7 @@ local function Main()
         BorderSizePixel = 0,
         ClearTextOnFocus = false,
         TextXAlignment = Enum.TextXAlignment.Left,
-        LayoutOrder = 8,
+        LayoutOrder = 50,
         Size = UDim2.fromScale(1, 1),
     })
     searchBox.Parent = topBar
@@ -686,7 +807,7 @@ local function Main()
         BackgroundColor3 = C.BtnIdle,
         BorderSizePixel = 0,
         AutoButtonColor = false,
-        LayoutOrder = 9,
+        LayoutOrder = 60,
         Size = UDim2.fromOffset(50, 20),
     })
     btnSettings.Parent = topBar
@@ -700,7 +821,46 @@ local function Main()
     end)
     addHover(btnSettings, function()
         btnSettings.BackgroundColor3 = C.BtnIdle
+    end, "Open settings")
+
+    -- ================================================================
+    -- TOPBAR GROUPS: dividers and timestamp toggle
+    -- ================================================================
+    local function mkDivider(order)
+        local d = new("Frame", {
+            BackgroundColor3 = C.Border,
+            BorderSizePixel  = 0,
+            Size             = UDim2.fromOffset(1, 16),
+            LayoutOrder      = order,
+        })
+        d.Parent = topBar
+        return d
+    end
+
+    mkDivider(5)   -- title | actions
+    mkDivider(15)  -- actions | filters
+    mkDivider(25)  -- filters | scroll
+    mkDivider(35)  -- scroll | count
+    mkDivider(55)  -- search | settings
+
+    local function updateTimestamp()
+        if showTimestamp then
+            btnTimestamp.BackgroundColor3 = C.BtnAccent
+            btnTimestamp.TextColor3 = Color3.new(1, 1, 1)
+        else
+            btnTimestamp.BackgroundColor3 = C.BtnIdle
+            btnTimestamp.TextColor3 = C.BtnTxt
+        end
+    end
+
+    btnTimestamp = mkBtn("Ts", "Ts", 23, 24)
+    btnTimestamp.MouseButton1Click:Connect(function()
+        showTimestamp = not showTimestamp
+        updateTimestamp()
+        refresh()
     end)
+    addHover(btnTimestamp, updateTimestamp, "Toggle timestamps")
+    updateTimestamp()
 
     -- ================================================================
     -- LOG DISPLAY
@@ -713,6 +873,12 @@ local function Main()
         Size = UDim2.new(1, 0, 1, -(C.TopBarH + C.EvalH + 3)),
     })
     logArea.Parent = consoleFrame
+    new("UIPadding", {
+        PaddingLeft   = UDim.new(0, 6),
+        PaddingRight  = UDim.new(0, 6),
+        PaddingTop    = UDim.new(0, 4),
+        PaddingBottom = UDim.new(0, 2),
+    }).Parent = logArea
 
     logBox = new("TextBox", {
         Name               = "LogBox",
@@ -734,6 +900,15 @@ local function Main()
     })
     logBox.Parent = logArea
 
+    -- Clicking inside the log box means the user is manually reading —
+    -- disable autoScroll so the view stays put.
+    logBox:GetPropertyChangedSignal("CursorPosition"):Connect(function()
+        if logBox:IsFocused() then
+            autoScroll = false
+            updateAutoScroll()
+        end
+    end)
+
     -- ================================================================
     -- EVAL BAR (at bottom of console)
     -- ================================================================
@@ -747,11 +922,14 @@ local function Main()
     })
     evalBar.Parent = consoleFrame
 
+    -- EvalBar top border — child of consoleFrame (NOT evalBar) to avoid
+    -- being included in evalBar's UIListLayout and breaking the layout.
     new("Frame", {
         BackgroundColor3 = C.Border,
         BorderSizePixel = 0,
         Size = UDim2.new(1, 0, 0, 1),
-    }).Parent = evalBar
+        Position = UDim2.new(0, 0, 1, -C.EvalH),
+    }).Parent = consoleFrame
 
     new("UIPadding", {
         PaddingLeft   = UDim.new(0, 8),
@@ -778,7 +956,7 @@ local function Main()
 
     evalBox = new("TextBox", {
         Name = "EvalInput",
-        PlaceholderText = "Lua... (Enter to run)",
+        PlaceholderText = "Lua... (Enter to run, ↑↓ history)",
         PlaceholderColor3 = C.Placeholder,
         Text = "",
         Font = C.Font,
@@ -787,12 +965,32 @@ local function Main()
         BackgroundTransparency = 1,
         ClearTextOnFocus = false,
         TextXAlignment = Enum.TextXAlignment.Left,
-        Size = UDim2.fromScale(1, 1),
+        Size = UDim2.fromOffset(0, 0),  -- UIFlexItem controls actual size
     })
     evalBox.Parent = evalBar
+    new("UIFlexItem", {
+        FlexMode = Enum.UIFlexMode.Fill,
+    }).Parent = evalBox
+
+    evalHistLabel = new("TextLabel", {
+        Name = "HistIdx",
+        Text = "",
+        Font = C.Font,
+        TextSize = C.LogSz - 1,
+        TextColor3 = C.Stamp,
+        BackgroundTransparency = 1,
+        Visible = false,
+        Size = UDim2.fromOffset(38, 16),
+        TextXAlignment = Enum.TextXAlignment.Right,
+    })
+    evalHistLabel.Parent = evalBar
 
     evalBox.FocusLost:Connect(function(enterPressed)
         if not enterPressed then
+            -- User blurred without submitting: hide history indicator and
+            -- reset the navigation index so the next session starts fresh.
+            evalHistIdx = 0
+            if evalHistLabel then evalHistLabel.Visible = false end
             return
         end
         local code = evalBox.Text
@@ -800,10 +998,19 @@ local function Main()
             return
         end
         evalBox.Text = ""
+        evalHistIdx = 0  -- reset navigation on new submission
+        if evalHistLabel then evalHistLabel.Visible = false end
+        -- Add to history (skip duplicates at top)
+        if evalHistory[1] ~= code then
+            table.insert(evalHistory, 1, code)
+            if #evalHistory > 50 then
+                table.remove(evalHistory)
+            end
+        end
         addLog("> " .. code, Enum.MessageType.MessageOutput)
-        local fn, err = loadstring(code)
+        local fn, compErr = loadstring(code)
         if not fn then
-            addLog("Compile error: " .. tostring(err), Enum.MessageType.MessageError)
+            addLog("Compile error: " .. tostring(compErr), Enum.MessageType.MessageError)
         else
             local ok, res = pcall(fn)
             if not ok then
@@ -814,41 +1021,129 @@ local function Main()
         end
     end)
 
+    -- Eval history navigation: Up = older, Down = newer
+    UserInputService.InputBegan:Connect(function(input, gpe)
+        if gpe then return end
+        if not evalBox:IsFocused() then return end
+        if input.KeyCode == Enum.KeyCode.Up then
+            if #evalHistory == 0 then return end
+            evalHistIdx = math.min(evalHistIdx + 1, #evalHistory)
+            evalBox.Text = evalHistory[evalHistIdx]
+            if evalHistLabel then
+                evalHistLabel.Text = evalHistIdx .. "/" .. #evalHistory
+                evalHistLabel.Visible = true
+            end
+            -- Move cursor to end
+            task.defer(function()
+                evalBox.CursorPosition = #evalBox.Text + 1
+            end)
+        elseif input.KeyCode == Enum.KeyCode.Down then
+            if evalHistIdx <= 0 then return end
+            evalHistIdx = evalHistIdx - 1
+            if evalHistIdx == 0 then
+                evalBox.Text = ""
+                if evalHistLabel then evalHistLabel.Visible = false end
+            else
+                evalBox.Text = evalHistory[evalHistIdx]
+                if evalHistLabel then
+                    evalHistLabel.Text = evalHistIdx .. "/" .. #evalHistory
+                end
+                task.defer(function()
+                    evalBox.CursorPosition = #evalBox.Text + 1
+                end)
+            end
+        end
+    end)
+
     -- ================================================================
     -- RESIZE HANDLE (subtle, bottom-right corner)
     -- ================================================================
     resizeHandle = new("ImageButton", {
         Name = "Resize",
-        BackgroundColor3 = Color3.fromRGB(40, 40, 45),
-        BackgroundTransparency = 0.6,
+        BackgroundColor3 = Color3.fromRGB(32, 32, 38),
+        BackgroundTransparency = 0.2,
         BorderSizePixel = 0,
         AutoButtonColor = false,
-        Size = UDim2.fromOffset(14, 14),
+        Size = UDim2.fromOffset(18, 18),
         Position = UDim2.fromScale(1, 1),
         AnchorPoint = Vector2.new(1, 1),
         ZIndex = 15,
     })
     resizeHandle.Parent = consoleFrame
+    new("UIStroke", {
+        Color = C.Border,
+        Thickness = 1,
+        ZIndex = 15,
+    }).Parent = resizeHandle
 
+    -- Grip lines: 3 diagonal lines of increasing length
     for i = 0, 2 do
         new("Frame", {
-            BackgroundColor3 = Color3.fromRGB(80, 80, 88),
-            BackgroundTransparency = 0.3,
+            BackgroundColor3 = Color3.fromRGB(110, 110, 122),
+            BackgroundTransparency = 0,
             BorderSizePixel = 0,
-            Size = UDim2.fromOffset(6, 1),
-            Position = UDim2.fromOffset(5 + i * 3, 7 + i * 3),
+            Size = UDim2.fromOffset(4 + i * 2, 1),
+            Position = UDim2.fromOffset(4 + i * 3, 8 + i * 3),
             Rotation = 45,
+            ZIndex = 16,
         }).Parent = resizeHandle
     end
 
     resizeHandle.MouseEnter:Connect(function()
-        resizeHandle.BackgroundTransparency = 0.2
+        resizeHandle.BackgroundTransparency = 0.0
+        if showTooltip then showTooltip("Resize") end
     end)
     resizeHandle.MouseLeave:Connect(function()
         if dragMode ~= "resize" then
-            resizeHandle.BackgroundTransparency = 0.6
+            resizeHandle.BackgroundTransparency = 0.2
         end
+        if hideTooltip then hideTooltip() end
     end)
+
+    -- ================================================================
+    -- TOOLTIP — floating hint label at ScreenGui level
+    -- ================================================================
+    local tooltipFrame = new("Frame", {
+        Name = "Tooltip",
+        BackgroundColor3 = Color3.fromRGB(36, 36, 42),
+        BorderSizePixel = 0,
+        Visible = false,
+        AutomaticSize = Enum.AutomaticSize.XY,
+        ZIndex = 300,
+    })
+    tooltipFrame.Parent = gui
+    new("UIStroke", { Color = C.Border, Thickness = 1, ZIndex = 300 }).Parent = tooltipFrame
+    new("UIPadding", {
+        PaddingLeft   = UDim.new(0, 6),
+        PaddingRight  = UDim.new(0, 6),
+        PaddingTop    = UDim.new(0, 3),
+        PaddingBottom = UDim.new(0, 3),
+    }).Parent = tooltipFrame
+    local tooltipText = new("TextLabel", {
+        Text = "",
+        Font = C.BtnFont,
+        TextSize = 10,
+        TextColor3 = C.Text,
+        BackgroundTransparency = 1,
+        AutomaticSize = Enum.AutomaticSize.XY,
+        Size = UDim2.fromOffset(0, 0),
+        ZIndex = 301,
+    })
+    tooltipText.Parent = tooltipFrame
+
+    showTooltip = function(tip)
+        tooltipText.Text = tip
+        local mouse = UserInputService:GetMouseLocation()
+        local vpV   = viewport()
+        local tx    = math.min(mouse.X + 14, vpV.X - 130)
+        local ty    = math.min(mouse.Y + 20, vpV.Y - 24)
+        tooltipFrame.Position = UDim2.fromOffset(tx, ty)
+        tooltipFrame.Visible  = true
+    end
+
+    hideTooltip = function()
+        tooltipFrame.Visible = false
+    end
 
     -- ================================================================
     -- SETTINGS — overlay at ScreenGui level, never clipped
@@ -882,7 +1177,8 @@ local function Main()
             BackgroundColor3 = C.SettingsBg,
             BorderSizePixel = 0,
             ZIndex = panelZ,
-            Size = UDim2.fromOffset(200, 210),
+            Size = UDim2.fromOffset(200, 0),
+            AutomaticSize = Enum.AutomaticSize.Y,
         })
         panel.Parent = settingsOverlay
         new("UIStroke", {
@@ -906,6 +1202,26 @@ local function Main()
         }).Parent = panel
 
         local barSz = math.round(C.BarSz * menuFontScale)
+
+        -- ── Panel Title ──
+        new("TextLabel", {
+            Text = "Console Settings",
+            Font = C.BtnFont,
+            TextSize = barSz,
+            TextColor3 = C.TitleCol,
+            BackgroundTransparency = 1,
+            Size = UDim2.fromOffset(184, 16),
+            TextXAlignment = Enum.TextXAlignment.Left,
+            LayoutOrder = -2,
+            ZIndex = panelZ + 1,
+        }).Parent = panel
+        new("Frame", {
+            BackgroundColor3 = C.Border,
+            BorderSizePixel = 0,
+            Size = UDim2.new(1, 0, 0, 1),
+            LayoutOrder = -1,
+            ZIndex = panelZ + 1,
+        }).Parent = panel
 
         -- ── Section 1: Position Presets ──
         new("TextLabel", {
@@ -1084,43 +1400,51 @@ local function Main()
             return valLabel
         end
 
-        settingsConsoleVal = makeScaleRow("Console Font", 4, consoleFontScale, function(val)
+        makeScaleRow("Console Font", 4, consoleFontScale, function(val)
             consoleFontScale = val
             applyFontScales()
         end, function()
             return consoleFontScale
         end)
 
-        settingsMenuVal = makeScaleRow("Menu Font", 5, menuFontScale, function(val)
+        makeScaleRow("Menu Font", 5, menuFontScale, function(val)
             menuFontScale = val
             applyFontScales()
         end, function()
             return menuFontScale
         end)
 
-        -- Position the panel near the console's top-right corner
+        -- Position the panel adjacent to the Settings button.
+        -- Prefer opening downward-left; flip sides when near viewport edges.
         local function positionPanel()
             if not consoleFrame or not settingsOverlay then
                 return
             end
             local absPos = consoleFrame.AbsolutePosition
             local absSz  = consoleFrame.AbsoluteSize
-            local pw, ph = 200, 210
+            local vpV    = viewport()
+            local pw     = 200
+            local ph     = panel.AbsoluteSize.Y
+            if ph < 10 then ph = 220 end  -- fallback before first render
+
+            -- Horizontal: align to right edge of console, flip left if it would overflow
             local x = absPos.X + absSz.X - pw - 4
-            local y = absPos.Y + C.TopBarH + 4
-            local vpV = viewport()
-            if x + pw > vpV.X then
-                x = vpV.X - pw - 8
-            end
-            if y + ph > vpV.Y then
-                y = vpV.Y - ph - 8
-            end
             if x < 4 then
-                x = 4
+                x = absPos.X + 4  -- flip: open from left edge instead
+            end
+            if x + pw > vpV.X - 4 then
+                x = vpV.X - pw - 4
+            end
+
+            -- Vertical: open below the topbar, flip upward if not enough room below
+            local y = absPos.Y + C.TopBarH + 4
+            if y + ph > vpV.Y - 4 then
+                y = absPos.Y - ph - 4  -- flip: open above the console
             end
             if y < 4 then
                 y = 4
             end
+
             panel.Position = UDim2.fromOffset(x, y)
         end
 
@@ -1176,10 +1500,12 @@ local function Main()
         if dragMode == "drag" then
             local dx = cur.X - dragMouse0.X
             local dy = cur.Y - dragMouse0.Y
-            consoleFrame.Position = UDim2.new(
-                dragPos0.X.Scale, dragPos0.X.Offset + dx,
-                dragPos0.Y.Scale, dragPos0.Y.Offset + dy
-            )
+            local vpV = viewport()
+            local fw  = consoleFrame.AbsoluteSize.X
+            local fh  = consoleFrame.AbsoluteSize.Y
+            local nx  = clamp(dragPos0.X.Offset + dx, 0, vpV.X - fw)
+            local ny  = clamp(dragPos0.Y.Offset + dy, 0, vpV.Y - fh)
+            consoleFrame.Position = UDim2.fromOffset(nx, ny)
         elseif dragMode == "resize" then
             local dx = cur.X - resizeMouse0.X
             local dy = cur.Y - resizeMouse0.Y
@@ -1193,7 +1519,7 @@ local function Main()
     UserInputService.InputEnded:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 and dragMode then
             dragMode = nil
-            resizeHandle.BackgroundTransparency = 0.6
+            resizeHandle.BackgroundTransparency = 0.2
             if currentPreset ~= "Draggable" then
                 snapToPreset(false)
             end
@@ -1212,25 +1538,27 @@ local function Main()
         end
     end)
 
-    -- DELETE KEY TOGGLE
+    -- DELETE / ESC KEY TOGGLE
     UserInputService.InputBegan:Connect(function(input, gpe)
         if gpe then
             return
         end
         if input.KeyCode == Enum.KeyCode.Delete then
             toggleConsole()
+        elseif input.KeyCode == Enum.KeyCode.Escape and isOpen then
+            -- Only close on ESC if the eval box is not focused
+            -- (so the user can ESC out of the textbox focus first)
+            if not evalBox:IsFocused() and not searchBox:IsFocused() then
+                closeConsole()
+            end
         end
     end)
 
     -- LOG SERVICE HOOK
-    LogService.MessageOut:Connect(function(msg, mt)
-        addLog(msg, mt)
+    LogService.MessageOut:Connect(function(msg, msgType)
+        addLog(msg, msgType)
     end)
 
-    -- WELCOME MESSAGES
-    addLog("[SPYTERMINAL] Loaded. Press DELETE to toggle.", Enum.MessageType.MessageOutput)
-    addLog("[Features] Clear | Copy | Filter | Search | Eval | Settings", Enum.MessageType.MessageOutput)
-    addLog("[Tip] Settings > presets & font scale. Corner grip = resize.", Enum.MessageType.MessageOutput)
 end
 
 -- Run with error protection
