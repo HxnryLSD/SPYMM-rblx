@@ -1,5 +1,5 @@
 --[[
-    SPYMM v8.2 - Obsidian UI
+    SPYMM v8.3 - Obsidian UI
     Survive the Apocalypse
 ]]
 
@@ -45,7 +45,7 @@ Library.ForceCheckbox = false
 Library.ShowToggleFrameInKeybinds = true
 
 local Window = Library:CreateWindow({
-    Title = "SPYMM v8.2",
+    Title = "SPYMM v8.3",
     Footer = "Survive the Apocalypse",
     NotifySide = "Right",
     ShowCustomCursor = true,
@@ -67,8 +67,6 @@ local connections = {}
 local mobESPInstances = {}
 local playerESPInstances = {}
 local structureESPInstances = {}
-local flyBV, flyBG = nil, nil
-local flyActive = false
 local antiAFKConn = nil
 local autoSprintActive = false
 local killAuraConn = nil
@@ -78,13 +76,8 @@ local fovCircle = nil              -- [ADDED v7.3.3] FOV Circle Drawing object f
 local killAuraIndicatorLine   = nil  -- [ADDED v7.3.3] Kill Aura snapline to current target
 local killAuraIndicatorCircle = nil  -- [ADDED v7.3.3] Kill Aura circle on current target
 -- Remove Fog state managed by enableRemoveFog/disableRemoveFog
--- bringPickup state managed by startBringPickup/stopBringPickup
 -- repairAura state managed by startRepairAura/stopRepairAura
 local repairAuraConn = nil
-
-local originalValues = {
-    walkSpeed = nil,
-}
 
 local originalLighting = { stored = false }
 local originalFog = { stored = false }
@@ -1127,21 +1120,6 @@ end
 setupStructureListeners()
 
 -- ============================================
--- SPEED HACK PERSISTENCE (FE BYPASS)
--- ============================================
-local speedHackConn = RunService.Stepped:Connect(function()
-    if not Toggles.SpeedHack then return end
-    if not Toggles.SpeedHack.Value then return end
-    local char = LocalPlayer.Character
-    if not char then return end
-    local humanoid = char:FindFirstChildOfClass("Humanoid")
-    if humanoid then
-        humanoid.WalkSpeed = Options.SpeedValue.Value
-    end
-end)
-table.insert(connections, speedHackConn)
-
--- ============================================
 -- NOCLIP (FE Bypass – prevents server rubber-band correction)
 -- Heartbeat fires before physics simulation, so CanCollide = false takes effect
 -- before the engine resolves collisions. Anti-rubberband detects sudden position
@@ -1178,80 +1156,6 @@ local noclipConn = RunService.Heartbeat:Connect(function()
     end
 end)
 table.insert(connections, noclipConn)
-
--- ============================================
--- FLY HACK
--- ============================================
-local stopFly  -- Forward declaration (defined below)
-
-local function startFly()
-    stopFly()
-    local char = LocalPlayer.Character
-    if not char then return end
-    local rootPart = char:FindFirstChild("HumanoidRootPart")
-    if not rootPart then return end
-    local humanoid = char:FindFirstChildOfClass("Humanoid")
-    if not humanoid then return end
-
-    humanoid.PlatformStand = true
-
-    flyBV = Instance.new("BodyVelocity")
-    flyBV.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-    flyBV.Velocity = Vector3.new(0, 0, 0)
-    flyBV.Parent = rootPart
-
-    flyBG = Instance.new("BodyGyro")
-    flyBG.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
-    flyBG.P = 9000
-    flyBG.CFrame = Workspace.CurrentCamera.CFrame
-    flyBG.Parent = rootPart
-
-    flyActive = true
-end
-
-stopFly = function()
-    flyActive = false
-    if flyBV then flyBV:Destroy() flyBV = nil end
-    if flyBG then flyBG:Destroy() flyBG = nil end
-
-    local char = LocalPlayer.Character
-    if char then
-        local humanoid = char:FindFirstChildOfClass("Humanoid")
-        if humanoid then
-            humanoid.PlatformStand = false
-        end
-    end
-end
-
-local flyMoveConn = RunService.RenderStepped:Connect(function()
-    if not Toggles.Fly then return end
-    if not Toggles.Fly.Value or not flyActive then return end
-
-    local char = LocalPlayer.Character
-    if not char or not char.Parent then
-        stopFly()
-        return
-    end
-    local rootPart = char:FindFirstChild("HumanoidRootPart")
-    if not rootPart then return end
-
-    local cam = Workspace.CurrentCamera
-    local speed = Options.FlySpeed.Value
-    local dir = Vector3.new(0, 0, 0)
-
-    if UserInputService:IsKeyDown(Enum.KeyCode.W) then dir = dir + cam.CFrame.LookVector end
-    if UserInputService:IsKeyDown(Enum.KeyCode.S) then dir = dir - cam.CFrame.LookVector end
-    if UserInputService:IsKeyDown(Enum.KeyCode.A) then dir = dir - cam.CFrame.RightVector end
-    if UserInputService:IsKeyDown(Enum.KeyCode.D) then dir = dir + cam.CFrame.RightVector end
-    if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir = dir + Vector3.new(0, 1, 0) end
-    if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then dir = dir - Vector3.new(0, 1, 0) end
-
-    if dir.Magnitude > 0 then dir = dir.Unit end
-
-    if flyBV then flyBV.Velocity = dir * speed end
-    if flyBG then flyBG.CFrame = cam.CFrame end
-end)
-table.insert(connections, flyMoveConn)
 
 -- ============================================
 -- FULLBRIGHT
@@ -2734,107 +2638,6 @@ local function startRepairAura()
 end
 
 -- ============================================
--- BRING PICKUP ITEM
--- Loop-teleport + PickUpItem remote. Works for all E-key items.
--- ============================================
-local bringPickupActive = false
-local bringPickupThread = nil
-
-local function stopBringPickup()
-    bringPickupActive = false
-    if bringPickupThread then
-        task.cancel(bringPickupThread)
-        bringPickupThread = nil
-    end
-end
-
-local function startBringPickup()
-    stopBringPickup()
-    bringPickupActive = true
-
-    bringPickupThread = task.spawn(function()
-        local MAX_TIMEOUTS = 3
-        local consecutiveTimeouts = 0
-
-        while bringPickupActive and Toggles.BringPickupItem.Value do
-            local char = LocalPlayer.Character
-            local rootPart = char and char:FindFirstChild("HumanoidRootPart")
-            if not rootPart then task.wait(0.5) continue end
-            if not droppedItemsFolder then task.wait(1) continue end
-
-            local playerPos  = rootPart.Position
-            local allSelected = Toggles.BringAllPickup and Toggles.BringAllPickup.Value
-            local whitelist  = Options.BringPickupWhitelist and Options.BringPickupWhitelist.Value or {}
-
-            local targets = {}
-            for _, item in ipairs(droppedItemsFolder:GetChildren()) do
-                if not pickupItemSet[item.Name] then continue end
-                local mp = item.PrimaryPart or getItemMainPart(item)
-                if not mp then continue end
-                local d = (mp.Position - playerPos).Magnitude
-                if not allSelected then
-                    if not whitelist[item.Name] then continue end
-                end
-                table.insert(targets, { item = item, part = mp, dist = d })
-            end
-
-            if #targets == 0 then task.wait(0.5) continue end
-
-            local sortOrder = Options.BringPickupSortOrder and Options.BringPickupSortOrder.Value or "Nearest First"
-            if sortOrder == "Nearest First" then
-                table.sort(targets, function(a, b) return a.dist < b.dist end)
-            elseif sortOrder == "Farthest First" then
-                table.sort(targets, function(a, b) return a.dist > b.dist end)
-            elseif sortOrder == "Alphabetical" then
-                table.sort(targets, function(a, b) return a.item.Name < b.item.Name end)
-            elseif sortOrder == "Reverse Alphabetical" then
-                table.sort(targets, function(a, b) return a.item.Name > b.item.Name end)
-            end
-
-            for _, target in ipairs(targets) do
-                if not bringPickupActive then break end
-                if not target.item.Parent then continue end
-
-                local itemRef = target.item
-                local partRef = target.part
-                local targetCF = CFrame.new(partRef.Position + Vector3.new(0, 2, 0))
-                local deadline = tick() + 2.0
-
-                while tick() < deadline and itemRef.Parent do
-                    rootPart.CFrame = targetCF
-                    pcall(function()
-                        if pickUpItemRemote then pickUpItemRemote:FireServer(itemRef) end
-                    end)
-                    task.wait(0.05)
-                end
-
-                if itemRef.Parent == nil then
-                    consecutiveTimeouts = 0
-                else
-                    consecutiveTimeouts = consecutiveTimeouts + 1
-                    if consecutiveTimeouts >= MAX_TIMEOUTS then
-                        bringPickupActive = false
-                        task.defer(function()
-                            if Toggles.BringPickupItem then
-                                Toggles.BringPickupItem:SetValue(false)
-                            end
-                            Library:Notify({
-                                Title       = "Bring Pickup Item",
-                                Description = "Backpack full – auto disabled.",
-                                Time        = 4,
-                            })
-                        end)
-                        return
-                    end
-                end
-            end
-        end
-
-        bringPickupActive = false
-    end)
-end
-
--- ============================================
 -- PLAYER JOIN / LEAVE LISTENERS
 -- ============================================
 local playerAddedConn = Players.PlayerAdded:Connect(function(player)
@@ -2854,14 +2657,12 @@ table.insert(connections, playerRemovingConn)
 -- CHARACTER RESPAWN HANDLER
 -- ============================================
 LocalPlayer.CharacterRemoving:Connect(function()
-    if flyActive then stopFly() end
     if autoSprintActive then stopAutoSprint() end
 end)
 
 LocalPlayer.CharacterAdded:Connect(function(char)
     char:WaitForChild("HumanoidRootPart", 10)
     task.wait(0.5)
-    if Toggles.Fly and Toggles.Fly.Value then startFly() end
     if Toggles.AutoSprint and Toggles.AutoSprint.Value then startAutoSprint() end
     if Toggles.AutoPickup and Toggles.AutoPickup.Value then startAutoPickup() end
 end)
@@ -3030,41 +2831,6 @@ do -- Player Tab local scope
 
 local movementGroup = Tabs.Player:AddLeftGroupbox("Movement", "move")
 
-movementGroup:AddToggle("SpeedHack", {
-    Text = "Speed Hack",
-    Default = false,
-    Callback = function(state)
-        if state then
-            local char = LocalPlayer.Character
-            if char then
-                local humanoid = char:FindFirstChildOfClass("Humanoid")
-                if humanoid then
-                    originalValues.walkSpeed = humanoid.WalkSpeed
-                end
-            end
-            Library:Notify({ Title = "Speed Hack", Description = "Enabled (FE bypass active)", Time = 2 })
-        else
-            local char = LocalPlayer.Character
-            if char then
-                local humanoid = char:FindFirstChildOfClass("Humanoid")
-                if humanoid then
-                    humanoid.WalkSpeed = originalValues.walkSpeed or 16
-                end
-            end
-            Library:Notify({ Title = "Speed Hack", Description = "Speed restored to " .. (originalValues.walkSpeed or 16), Time = 2 })
-        end
-    end,
-})
-
-movementGroup:AddSlider("SpeedValue", {
-    Text = "Walk Speed",
-    Default = 50,
-    Min = 16,
-    Max = 200,
-    Rounding = 0,
-    Suffix = " studs/s",
-})
-
 movementGroup:AddToggle("InfJump", {
     Text = "Inf Jump",
     Default = false,
@@ -3100,29 +2866,6 @@ movementGroup:AddToggle("NoClip", {
             Time = 2,
         })
     end,
-})
-
-movementGroup:AddToggle("Fly", {
-    Text = "Fly",
-    Default = false,
-    Callback = function(state)
-        if state then
-            startFly()
-            Library:Notify({ Title = "Fly", Description = "Enabled - WASD to move, Space/Shift for up/down", Time = 3 })
-        else
-            stopFly()
-            Library:Notify({ Title = "Fly", Description = "Disabled", Time = 2 })
-        end
-    end,
-})
-
-movementGroup:AddSlider("FlySpeed", {
-    Text = "Fly Speed",
-    Default = 50,
-    Min = 10,
-    Max = 300,
-    Rounding = 0,
-    Suffix = " studs/s",
 })
 
 movementGroup:AddToggle("AutoSprint", {
@@ -3179,6 +2922,18 @@ danceGroup:AddDropdown("DanceStyle", {
     Text = "Dance Style",
     Tooltip = "Select dance style. Toggle off and on again to apply a new style.",
 })
+
+-- Update Notice groupbox
+local updateNoticeGroup = Tabs.Player:AddRightGroupbox("Update Notice", "info")
+
+updateNoticeGroup:AddLabel("I tried everything, but Speed Hack, Fly,")
+updateNoticeGroup:AddLabel("and Bring Pickup Item could not be made")
+updateNoticeGroup:AddLabel("to work. The server validates positions too")
+updateNoticeGroup:AddLabel("aggressively to do anything with them.")
+updateNoticeGroup:AddLabel("")
+updateNoticeGroup:AddLabel("I still hope everyone enjoys this script,")
+updateNoticeGroup:AddLabel("even if a few of the best features no")
+updateNoticeGroup:AddLabel("longer work. Have fun!")
 
 end -- Player Tab local scope
 
@@ -3447,48 +3202,6 @@ autoPickupGroup:AddDropdown("AutoPickupBlacklist", {
     Searchable = true,
 })
 
--- RIGHT: Bring Pickup Item (E-key items: Guns, Melee, Medical, Ammo, etc.)
-local bringPickupGroup = Tabs.Exploits:AddRightGroupbox("Bring Pickup Item", "download")
-
-bringPickupGroup:AddToggle("BringPickupItem", {
-    Text = "Bring Pickup Item",
-    Default = false,
-    Tooltip = "Loop-teleports to E-key items (Guns, Medical, Ammo, Armor...). Stops automatically when full.",
-    Callback = function(state)
-        if state then
-            startBringPickup()
-            Library:Notify({ Title = "Bring Pickup Item", Description = "Enabled!", Time = 2 })
-        else
-            stopBringPickup()
-            Library:Notify({ Title = "Bring Pickup Item", Description = "Disabled", Time = 2 })
-        end
-    end,
-})
-
-bringPickupGroup:AddToggle("BringAllPickup", {
-    Text = "All Pickup Items",
-    Default = false,
-    Tooltip = "Pick up all E-key items without a filter.",
-})
-
-bringPickupGroup:AddDropdown("BringPickupSortOrder", {
-    Values = {"Nearest First", "Farthest First", "Alphabetical", "Reverse Alphabetical"},
-    Default = 1,
-    Text = "Sort Order",
-    Tooltip = "Sets which items are picked up first.",
-})
-
-bringPickupGroup:AddDivider()
-bringPickupGroup:AddLabel("Filter (" .. #pickupItemNames .. " Items)")
-bringPickupGroup:AddDropdown("BringPickupWhitelist", {
-    Values = pickupItemNames,
-    Default = 1,
-    Multi = true,
-    Text = "Item Filter",
-    Tooltip = "Only active when 'All Pickup Items' is off.",
-    Searchable = true,
-})
-
 -- RIGHT (second): Repair Aura
 local repairAuraGroup = Tabs.Exploits:AddRightGroupbox("Repair Aura", "wrench")
 
@@ -3737,7 +3450,7 @@ Library:OnUnload(function()
     stopAntiAFK()
 
     Library:Notify({ Title = "SPYMM", Description = "Unloaded. Bye!", Time = 3 })
-    print("SPYMM v8.2 unloaded.")
+    print("SPYMM v8.3 unloaded.")
 end)
 
 -- ============================================
@@ -3820,10 +3533,10 @@ SaveManager:LoadAutoloadConfig()
 -- ============================================
 -- INIT NOTIFICATION
 -- ============================================
-Library:Notify({ Title = "SPYMM v8.2", Description = "Loaded! Gun|Melee|Medical|Armor|Food|Resources\nRight Shift = toggle menu.", Time = 5 })
+Library:Notify({ Title = "SPYMM v8.3", Description = "Loaded! Gun|Melee|Medical|Armor|Food|Resources\nRight Shift = toggle menu.", Time = 5 })
 
 local espCounts = { Gun="Red", Melee="Orange", Medical="Green", Armor="Blue", Food="Lime", Resource="Silver" }
-print("SPYMM v8.2 loaded | " .. #itemNames .. " items tracked | Right Shift = menu")
+print("SPYMM v8.3 loaded | " .. #itemNames .. " items tracked | Right Shift = menu")
 for cat, col in pairs(espCounts) do
     print(string.format("  %s ESP (%s) - %d items", cat, col, #espSystems[cat].items))
 end
