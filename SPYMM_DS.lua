@@ -1,19 +1,7 @@
 --[[
-    ╔══════════════════════════════════════════════════════════════╗
-    ║                     SPYMM TRAINER                          ║
-    ║                  Dead Shelter - Roblox                      ║
-    ║                                                             ║
-    ║  UI: Obsidian by deivid (https://docs.mspaint.cc/obsidian) ║
-    ║                                                             ║
-    ║  Features:                                                  ║
-    ║    • Walkspeed / Jump Power / Infinite Jump / No Clip      ║
-    ║    • FOV Changer                                           ║
-    ║    • Kill Aura (FE Bypass, melee required)                 ║
-    ║    • Item ESP / Monster ESP (separate text display)        ║
-    ║    • No Fog / Full Bright                                  ║
-    ║    • Bring Item (Unweld + GetLocalWeld FE Bypass)          ║
-    ╚══════════════════════════════════════════════════════════════╝
---]]
+    SPYMM v1.2 - Obsidian UI
+    Dead Shelter
+]]
 
 -- ═══════════════════════════════════════════════════════════════
 -- SERVICES & REFERENCES
